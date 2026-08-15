@@ -20,7 +20,7 @@ import math
 import copy
 from datetime import datetime, timedelta
 from config import THIS_VERSION
-from const import TIME_FORMAT, PREDICT_STEP
+from const import TIME_FORMAT, PREDICT_STEP, CAR_SOLAR_EXPORT_ALWAYS
 from utils import dp0, dp1, dp2, dp3, calc_percent_limit, minute_data, minute_data_state
 from prediction import Prediction
 
@@ -71,6 +71,33 @@ class Output:
     charging schedules, and financial metric summaries.
     """
 
+    def publish_car_solar_slot(self, car_n, postfix):
+        """
+        Publish whether solar surplus should be diverted to this car right now.
+
+        On means the surplus is worth less exported than the charge it displaces, so an external charger
+        (e.g. EVCC) should run in its solar/PV mode. Off means sell the surplus instead and let the planned
+        grid slots - published as binary_sensor.<prefix>_car_charging_slot - cover the car.
+        """
+        if not self.car_charging_solar[car_n]:
+            return
+
+        threshold = self.car_charging_solar_export_threshold[car_n]
+        export_rate = self.rate_export.get(self.minutes_now, 0)
+        allowed = self.car_charging_plugged[car_n] and export_rate <= threshold
+
+        self.dashboard_item(
+            "binary_sensor." + self.prefix + "_car_charging_solar_slot" + postfix,
+            state="on" if allowed else "off",
+            attributes={
+                "friendly_name": "Predbat divert solar to car" + postfix,
+                "export_rate": dp2(export_rate),
+                "threshold": None if threshold >= CAR_SOLAR_EXPORT_ALWAYS else dp2(threshold),
+                "plugged_in": self.car_charging_plugged[car_n],
+                "icon": "mdi:solar-power-variant",
+            },
+        )
+
     def publish_car_plan(self):
         """
         Publish the car charging plan
@@ -80,6 +107,7 @@ class Output:
         for car_n in range(self.num_cars):
             if car_n > 0:
                 postfix = "_" + str(car_n)
+            self.publish_car_solar_slot(car_n, postfix)
             if not self.car_charging_slots[car_n]:
                 self.dashboard_item(
                     "binary_sensor." + self.prefix + "_car_charging_slot" + postfix,
@@ -1465,12 +1493,22 @@ class Output:
                 cost_color = "#FFFFFF"
 
             # Car charging?
+            car_solar_change = 0.0
             if self.num_cars > 0:
                 car_charging_kwh = self.car_charge_slot_kwh(minute_start, minute_end)
-                car_total += car_charging_kwh
+                # Opportunistic solar diversion modelled in the forecast (cumulative kWh, like iBoost)
+                car_solar_amount = self.predict_car_solar_best.get(minute_relative_start, 0)
+                car_solar_amount_end = self.predict_car_solar_best.get(minute_relative_slot_end, car_solar_amount)
+                car_solar_change = max(car_solar_amount_end - car_solar_amount, 0.0)
+                car_total += car_charging_kwh + car_solar_change
                 if car_charging_kwh > 0.0:
-                    car_charging_str = str(car_charging_kwh)
-                    car_color = "FFFF00"
+                    # Planned (grid) charging - shown yellow, includes any solar diverted in the same slot
+                    car_charging_str = str(dp2(car_charging_kwh + car_solar_change))
+                    car_color = "#FFFF00"
+                elif car_solar_change > 0.0:
+                    # Pure opportunistic solar diversion - shown green
+                    car_charging_str = str(dp2(car_solar_change))
+                    car_color = "#AEF8A0"
                 else:
                     car_charging_str = "&#9866;"
                     car_color = "#FFFFFF"
@@ -1651,7 +1689,9 @@ class Output:
                 json_row["extra_load_total"] = raw_extra_forecast_total
                 json_row["extra_color"] = extra_color
             if self.num_cars > 0:
-                json_row["car_charging"] = car_charging_kwh
+                # Include the modelled opportunistic solar diversion so the JSON/web plan view matches the HTML cell
+                json_row["car_charging"] = dp2(car_charging_kwh + car_solar_change)
+                json_row["car_solar"] = dp2(car_solar_change)
                 json_row["car_color"] = car_color
             if self.iboost_enable:
                 json_row["iboost"] = iboost_amount
@@ -3088,6 +3128,7 @@ class Output:
         carbon_today_sofar = self.carbon_today_sofar
         soc_kw = self.soc_kw
         car_charging_hold = self.car_charging_hold
+        car_charging_in_load_history = self.car_charging_in_load_history
         iboost_energy_subtract = self.iboost_energy_subtract
         load_minutes_now = self.load_minutes_now
         soc_max = self.soc_max
@@ -3112,6 +3153,9 @@ class Output:
         self.forecast_minutes = end_record
         self.pv_today_now = 0
         self.car_charging_hold = False
+        # yesterday_reconstruct_car_slots subtracts the reconstructed slot energy from yesterday_load_step and
+        # relies on the prediction adding it back, so the double-count guard must be off for the replay.
+        self.car_charging_in_load_history = False
         self.iboost_energy_subtract = False
         self.load_minutes_now = 0
         self.rate_import = past_rates
@@ -3420,6 +3464,7 @@ class Output:
         self.carbon_today_sofar = carbon_today_sofar
         self.pv_today_now = pv_today_now
         self.car_charging_hold = car_charging_hold
+        self.car_charging_in_load_history = car_charging_in_load_history
         self.iboost_energy_subtract = iboost_energy_subtract
         self.load_minutes_now = load_minutes_now
         self.soc_max = soc_max
