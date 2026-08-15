@@ -54,6 +54,10 @@ LOW_POWER_PV_THRESHOLD = 0.1
 
 INVERTER_TEST = False  # Run inverter control self test
 
+# Export rate above which solar is never diverted to the car. The default means "no limit" - solar is always
+# taken - matching the iboost_rate_threshold_export convention of a rate no real tariff will reach.
+CAR_SOLAR_EXPORT_ALWAYS = 9999.0
+
 # Create an array of times in the day in 5-minute intervals
 BASE_TIME = datetime.strptime("00:00:00", "%H:%M:%S")
 OPTIONS_TIME = [((BASE_TIME + timedelta(seconds=minute * 60)).strftime("%H:%M:%S")) for minute in range(0, 24 * 60, 5)]
