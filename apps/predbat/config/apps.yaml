@@ -362,6 +362,14 @@ pred_bat:
   #car_charging_exclusive:
   #  - True
 
+  # evcc integration - reads your charger, car and departure plans over the evcc REST API and fills in
+  # the car_charging_* settings above for you. Any key you set yourself is left alone.
+  # See https://springfall2008.github.io/batpred/components/#evcc-ev-charger-evcc
+  #evcc_host: 'http://192.168.1.50:7070'
+  #evcc_automatic: True
+  # Let Predbat set the evcc charging mode (solar / fast / off). Off by default - enable deliberately.
+  #evcc_control: True
+
   # Octopus Energy direct integration
   #octopus_api_key: !secret octopus_api_key
   #octopus_api_account: !secret octopus_api_account
