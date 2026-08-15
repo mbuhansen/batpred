@@ -154,6 +154,7 @@ entrez
 epod
 etok
 euids
+evcc
 EVDC
 evergen
 evse
@@ -268,6 +269,8 @@ linebreak
 linestyle
 loadml
 loadmlpower
+loadpoint
+loadpoints
 loadspower
 localfolder
 locationless
@@ -295,6 +298,7 @@ metricmid
 microinverters
 minb
 minmax
+minpv
 minsoc
 minsocongrid
 minuteb
@@ -356,6 +360,7 @@ overfitting
 overvoltage
 ownerapi
 parseable
+Passat
 pbat
 pbgw
 pdata
@@ -364,6 +369,7 @@ pendings
 perc
 percnt
 peterhaban
+PHEV
 photovoltaics
 pitem
 pkwh
