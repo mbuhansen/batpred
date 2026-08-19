@@ -58,6 +58,14 @@ INVERTER_TEST = False  # Run inverter control self test
 # taken - matching the iboost_rate_threshold_export convention of a rate no real tariff will reach.
 CAR_SOLAR_EXPORT_ALWAYS = 9999.0
 
+# States a car_charging_plugged sensor may report for "plugged in", on top of whatever the user put in
+# car_charging_now_response. That list is written for a charger's own status text and cannot be relied on
+# here: the evcc component points car_charging_plugged at a binary sensor reporting exactly on/off, and an
+# unquoted "on" in a YAML list is parsed as a boolean, so the string would never match at all
+CAR_PLUGGED_RESPONSE = ["on", "true", "yes", "1", "connected", "charging"]
+# Recognised "not plugged in" states, so only a genuinely unrecognised state is worth warning about
+CAR_UNPLUGGED_RESPONSE = ["off", "false", "no", "0", "disconnected", "unavailable", "unknown", "none", ""]
+
 # Create an array of times in the day in 5-minute intervals
 BASE_TIME = datetime.strptime("00:00:00", "%H:%M:%S")
 OPTIONS_TIME = [((BASE_TIME + timedelta(seconds=minute * 60)).strftime("%H:%M:%S")) for minute in range(0, 24 * 60, 5)]
