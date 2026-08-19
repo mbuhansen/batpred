@@ -585,9 +585,15 @@ With `evcc_control: True`, Predbat maps its own decision onto evcc's modes:
 
 | Predbat state | evcc mode |
 | ------------- | --------- |
-| `binary_sensor.predbat_car_charging_slot` on - a grid slot is planned | `now` |
-| otherwise `binary_sensor.predbat_car_charging_solar_slot` on | `pv` (or `minpv` with `evcc_use_minpv`) |
-| otherwise | `off` |
+| `now` - a grid slot is planned | `now` |
+| `solar` - take the surplus, or nothing is planned | `pv` (or `minpv` with `evcc_use_minpv`) |
+| `off` - the export pays better, or this car does no solar charging | `off` |
+
+The decision is not made here: it is Predbat's own `sensor.predbat_car_charging_mode`, described under
+[the charging mode](car-charging.md#the-charging-mode), so evcc and a plain Home Assistant automation
+driving some other charger act on identical logic. Note that `solar` is the resting state - evcc is left
+in `pv` rather than `off` when nothing is planned, because `off` disables the loadpoint and takes evcc's
+own departure plan down with it, which is the plan this component exists to read.
 
 Writes only happen when the plan is valid and fresh, `switch.predbat_set_read_only` is off, and the runtime
 switch is on; every refusal is published as the `reason` attribute on `sensor.predbat_evcc_target_mode`, so

@@ -50,7 +50,7 @@ from tests.test_nordpool import run_nordpool_test
 from tests.test_futurerate_auto import test_futurerate_auto
 from tests.test_car_charging_smart import run_car_charging_smart_tests
 from tests.test_evcc import test_evcc
-from tests.test_car_charging_in_load_history import run_car_charging_in_load_history_tests, run_car_plugged_state_tests
+from tests.test_car_charging_in_load_history import run_car_charging_in_load_history_tests, run_car_plugged_state_tests, run_car_charging_mode_tests
 from tests.test_plugin_startup import test_plugin_startup_order
 from tests.test_active_flag import test_active_flag
 from tests.test_component_health_status import test_component_health_status
@@ -453,6 +453,7 @@ def main():
         ("car_charging_smart", run_car_charging_smart_tests, "Car charging smart tests", False),
         ("car_charging_in_load_history", run_car_charging_in_load_history_tests, "Car charging in load history tests", False),
         ("car_plugged_state", run_car_plugged_state_tests, "Car plugged-in sensor state tests", False),
+        ("car_charging_mode", run_car_charging_mode_tests, "Car charging mode decision tests", False),
         ("evcc", test_evcc, "evcc EV charger API tests (plans, power band, auto-config, mode control)", False),
         ("intersect_window", run_intersect_window_tests, "Intersect window tests", False),
         ("clone_windows", run_clone_windows_tests, "Clone windows tests", False),

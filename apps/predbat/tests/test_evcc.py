@@ -21,6 +21,7 @@ import pytz
 from components import COMPONENT_LIST
 from config import APPS_SCHEMA
 from evcc import (
+    EVCC_MODE_MINPV,
     EVCC_MODE_NOW,
     EVCC_MODE_OFF,
     EVCC_MODE_PV,
@@ -398,33 +399,35 @@ def test_desired_mode_and_gates():
     api.loadpoint_map = {0: 0}
     api.state_time = api.now_utc
 
-    def set_sensors(slot, solar):
-        """Publish the two decision sensors the component reads."""
-        if slot is not None:
-            api.entities["binary_sensor.predbat_car_charging_slot"] = {"state": slot, "attributes": {}}
+    def set_mode(mode, reason=None):
+        """Publish the charging-mode sensor Predbat writes, which is all this component reads."""
+        if mode is not None:
+            api.entities["sensor.predbat_car_charging_mode"] = {"state": mode, "attributes": {"reason": reason or mode}}
         else:
-            api.entities.pop("binary_sensor.predbat_car_charging_slot", None)
-        if solar is not None:
-            api.entities["binary_sensor.predbat_car_charging_solar_slot"] = {"state": solar, "attributes": {}}
-        else:
-            api.entities.pop("binary_sensor.predbat_car_charging_solar_slot", None)
+            api.entities.pop("sensor.predbat_car_charging_mode", None)
 
-    set_sensors("on", "off")
+    set_mode("now", "grid_slot")
     check("grid_slot", api.desired_mode(0), (EVCC_MODE_NOW, "grid_slot"), failures)
-    set_sensors("on", "on")
-    check("grid_wins", api.desired_mode(0)[0], EVCC_MODE_NOW, failures)
-    set_sensors("off", "on")
+    set_mode("solar", "solar")
     check("solar", api.desired_mode(0), (EVCC_MODE_PV, "solar"), failures)
-    set_sensors("off", "off")
-    check("idle", api.desired_mode(0), (EVCC_MODE_OFF, "idle"), failures)
-    # A solar sensor is only published for solar cars, so its absence means "no solar"
-    set_sensors("off", None)
-    check("no_solar_sensor", api.desired_mode(0)[0], EVCC_MODE_OFF, failures)
-    # No charging-slot sensor means Predbat has not planned yet - that must never read as "off"
-    set_sensors(None, "on")
+    # Resting in pv rather than off, so evcc keeps its own departure plan alive
+    set_mode("solar", "idle")
+    check("idle", api.desired_mode(0), (EVCC_MODE_PV, "idle"), failures)
+    # Off is a decision, not an absence: selling the surplus pays better, or the car does no solar
+    set_mode("off", "export_better")
+    check("export_better", api.desired_mode(0), (EVCC_MODE_OFF, "export_better"), failures)
+    set_mode("off", "solar_disabled")
+    check("solar_disabled", api.desired_mode(0), (EVCC_MODE_OFF, "solar_disabled"), failures)
+    # minpv replaces pv everywhere pv would be used, resting state included
+    api.use_minpv = True
+    set_mode("solar", "idle")
+    check("idle_minpv", api.desired_mode(0), (EVCC_MODE_MINPV, "idle"), failures)
+    api.use_minpv = False
+    # No mode sensor means Predbat has not planned yet - that must never read as "off"
+    set_mode(None)
     check("no_plan_yet", api.desired_mode(0), (None, "no_plan_yet"), failures)
 
-    set_sensors("off", "off")
+    set_mode("solar", "idle")
     check("allowed", api.should_write(0, EVCC_MODE_OFF, "idle"), (True, "idle"), failures)
     check("mode_none", api.should_write(0, None, "no_plan_yet")[1], "no_plan_yet", failures)
 
@@ -483,7 +486,7 @@ def test_apply_modes_writes():
     api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="off")]}
     api.state_time = api.now_utc
     api.loadpoint_map = {0: 0}
-    api.entities["binary_sensor.predbat_car_charging_slot"] = {"state": "on", "attributes": {}}
+    api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
 
     writes = []
 
