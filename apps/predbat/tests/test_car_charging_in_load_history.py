@@ -204,3 +204,78 @@ def run_car_charging_mode_tests(my_predbat):
         setattr(my_predbat, name, value)
 
     return failed
+
+
+def run_car_solar_possible_tests(my_predbat):
+    """
+    Test that the plan marks a slot where the charger may divert, even when nothing is expected
+
+    A surplus too small to start the charger produces no energy, but the charger is still free to take
+    it - the plan has to separate that from "no sun at all", which looks identical otherwise.
+    """
+    failed = False
+    print("**** Running Car solar possible tests ****")
+
+    saved = {
+        name: getattr(my_predbat, name)
+        for name in [
+            "num_cars",
+            "car_charging_solar",
+            "car_charging_plugged",
+            "car_charging_soc",
+            "car_charging_limit",
+            "car_charging_solar_limit",
+            "car_charging_solar_min_power",
+            "car_charging_solar_max_power",
+            "car_charging_solar_min_soc",
+            "car_charging_solar_export_threshold",
+            "car_charging_slots",
+            "car_charging_loss",
+            "soc_kw",
+            "soc_max",
+            "prediction_kernel_enable",
+        ]
+    }
+
+    my_predbat.num_cars = 1
+    my_predbat.car_charging_solar = [True]
+    my_predbat.car_charging_plugged = [True]
+    my_predbat.car_charging_soc = [0.0]
+    my_predbat.car_charging_limit = [50.0]
+    my_predbat.car_charging_solar_limit = [50.0]
+    my_predbat.car_charging_solar_max_power = [7.4]
+    my_predbat.car_charging_solar_min_soc = 0.0
+    my_predbat.car_charging_solar_export_threshold = [CAR_SOLAR_EXPORT_ALWAYS]
+    my_predbat.car_charging_slots = [[]]
+    my_predbat.car_charging_loss = 1.0
+    my_predbat.soc_kw = 5.0
+    my_predbat.soc_max = 10.0
+    my_predbat.prediction_kernel_enable = False
+
+    # PV well above the house load, but the charger needs more than the surplus to start
+    for min_power, expect_energy in ((0.0, True), (100.0, False)):
+        my_predbat.car_charging_solar_min_power = [min_power]
+        pred, _, _ = build_prediction(my_predbat, pv_amount=1.0, load_amount=0.1)
+        pred.run_prediction([], [], [], [], False, end_record=my_predbat.end_record, save="best")
+        diverted = max(pred.predict_car_solar_best.values()) if pred.predict_car_solar_best else 0
+        possible = any(pred.predict_car_solar_possible_best.values())
+        if not possible:
+            print("ERROR: min_power {} should still mark the slot as a diversion opportunity".format(min_power))
+            failed = True
+        if (diverted > 0) != expect_energy:
+            print("ERROR: min_power {} diverted {}kWh, expected {}".format(min_power, diverted, "some" if expect_energy else "none"))
+            failed = True
+
+    # Not plugged in is not an opportunity
+    my_predbat.car_charging_plugged = [False]
+    my_predbat.car_charging_solar_min_power = [0.0]
+    pred, _, _ = build_prediction(my_predbat, pv_amount=1.0, load_amount=0.1)
+    pred.run_prediction([], [], [], [], False, end_record=my_predbat.end_record, save="best")
+    if any(pred.predict_car_solar_possible_best.values()):
+        print("ERROR: an unplugged car must not mark a diversion opportunity")
+        failed = True
+
+    for name, value in saved.items():
+        setattr(my_predbat, name, value)
+
+    return failed

@@ -1546,12 +1546,15 @@ class Output:
                 car_solar_amount_end = self.predict_car_solar_best.get(minute_relative_slot_end, car_solar_amount)
                 car_solar_change = max(car_solar_amount_end - car_solar_amount, 0.0)
                 car_total += car_charging_kwh + car_solar_change
+                # True when the charger was free to divert somewhere in this slot - see prediction.py. A slot
+                # can be green with nothing in it: the surplus was there but too small to start the charger
+                car_solar_possible = any(self.predict_car_solar_possible_best.get(minute, False) for minute in range(minute_relative_start, minute_relative_slot_end, PREDICT_STEP))
                 if car_charging_kwh > 0.0:
                     # Planned (grid) charging - shown yellow, includes any solar diverted in the same slot
                     car_charging_str = str(dp2(car_charging_kwh + car_solar_change))
                     car_color = "#FFFF00"
-                elif car_solar_change > 0.0:
-                    # Pure opportunistic solar diversion - shown green
+                elif car_solar_change > 0.0 or car_solar_possible:
+                    # Opportunistic solar diversion, or the chance of it - shown green
                     car_charging_str = str(dp2(car_solar_change))
                     car_color = "#AEF8A0"
                 else:

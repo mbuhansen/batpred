@@ -541,6 +541,7 @@ class Prediction(PredictionBatch):
         self.predict_carbon_best = {}
         self.predict_clipped_best = {}
         self.predict_car_solar_best = {}
+        self.predict_car_solar_possible_best = {}
         self.iboost_running = False
         self.iboost_running_solar = False
         self.iboost_running_full = False
@@ -827,6 +828,11 @@ class Prediction(PredictionBatch):
                     if self.car_charging_solar[car_n] and self.car_charging_plugged[car_n] and pv_now > 0 and car_soc[car_n] < self.car_charging_solar_limit[car_n]:
                         # Home battery priority: only divert to the car once the home battery SoC is above the threshold
                         if soc_max <= 0 or (soc * 100.0 / soc_max) >= self.car_charging_solar_min_soc:
+                            # Everything that gates the diversion is satisfied, so the charger is free to divert here
+                            # even if the surplus turns out to be too small to start it. Recorded separately from the
+                            # energy so the plan can distinguish "allowed, and nothing expected" from "not allowed"
+                            if enable_save_stats:
+                                self.predict_car_solar_possible_best[minute] = True
                             # Only the PV left after the house load is served is available to the car
                             surplus = max(pv_now - load_yesterday, 0)
                             # Available charge power (kW), capped at the maximum diversion power
