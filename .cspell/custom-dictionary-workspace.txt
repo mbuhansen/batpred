@@ -125,6 +125,7 @@ docstrings
 dstamp
 dstart
 dwindow
+Easee
 eauth
 Eddi
 elif
