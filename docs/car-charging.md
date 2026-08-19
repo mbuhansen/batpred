@@ -453,6 +453,10 @@ Without this, Predbat's home battery forecast is too optimistic on exactly the s
 The `car_charging_solar` mode models this behaviour. It is **modelling only**: Predbat reflects the diverted energy in its forecast but never commands the car.
 It generalises the iBoost solar diversion logic to the car loadpoint, without the iBoost power cap, so it works at the full charge power of a 3-phase charger.
 
+This works with **any** charger that follows the surplus itself - a Zappi in ECO+, a Wallbox in Eco-Smart, an Easee, a go-e, EVCC, or a Home Assistant automation
+of your own. It does not need the [evcc component](components.md#evcc-ev-charger-evcc): the settings below are ordinary `apps.yaml` keys, and evcc simply fills
+them in for you when you use it. Set them by hand and the model behaves identically.
+
 When enabled for a car:
 
 - Predbat plans **no** grid/low-rate slots for that car (unless a departure plan is active).
@@ -474,6 +478,41 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
   Defaults to `car_charging_limit` when not set. With EVCC this is the loadpoint's limit SoC (its PV cap), while `car_charging_limit` is the departure plan target.
 - **input_number.predbat_car_charging_solar_min_soc** - home battery SoC threshold (%) in Home Assistant. The car only takes solar once the home battery is above this level,
   mirroring EVCC's priority SoC so the home battery is charged first. Default 0%.
+
+### Setting it up by hand
+
+A worked example for a 3-phase 6-16A charger that diverts surplus on its own, charging one car to 80% from the sun while a plan still guarantees the departure target:
+
+```yaml
+  car_charging_solar:
+    - True
+  # Needed to know about future daylight hours - "charging now" says nothing about this afternoon
+  car_charging_plugged:
+    - 're:binary_sensor.myenergi_zappi_[0-9a-z]+_plug_status'
+  car_charging_solar_max_power:
+    - 11.0    # 3-phase 16A
+  car_charging_solar_min_power:
+    - 4.1     # 3-phase 6A - below this the charger will not start
+  car_charging_solar_power_step:
+    - 0.69    # 1A on 3 phases
+  car_charging_solar_limit:
+    - 80      # the PV cap, independent of the car_charging_limit departure target
+```
+
+Three of those numbers decide how closely the model tracks reality, so it is worth getting them from the charger's own settings rather than estimating:
+
+- **car_charging_solar_min_power** too low models a diversion that never happens; too high and real diversions are missed.
+- **car_charging_solar_power_step** left at 0 makes the model follow the surplus exactly, which slightly over-estimates on a day of moving cloud - a real charger
+  switches in whole current steps and leaves the remainder to the battery or export.
+- **input_number.predbat_car_charging_solar_min_soc** should match whatever "home battery priority" setting the charger has, or model and reality diverge
+  exactly around midday.
+
+What the model does *not* capture is hysteresis: it follows the surplus every 5 minute step, while a real charger usually waits a few minutes before starting and
+stopping so it does not flip back and forth under moving cloud. On a settled sunny day that makes no difference; on a showery one the model diverts a little more
+than the charger actually does.
+
+The cheapest way to calibrate is to let it run for a couple of sunny days and compare the green car column on the plan against what `car_charging_energy` actually
+recorded. If the model sits high, `car_charging_solar_min_power` or `car_charging_solar_power_step` is usually set too low.
 
 On the [Predbat plan](predbat-plan-card.md), solar diverted to the car is shown in the car column in **green** (as opposed to yellow for planned grid charging).
 
