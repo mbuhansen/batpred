@@ -577,6 +577,7 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | `sensor.predbat_evcc_target_mode` | The mode Predbat wants, with a `reason` explaining why it was or was not written |
 | `binary_sensor.predbat_evcc_override` | On when somebody changed the mode in evcc and Predbat has backed off |
 | `switch.predbat_evcc_control` | Runtime kill switch for mode writing (only when `evcc_control` is set) |
+| `sensor.predbat_evcc_priority_soc` | The site's home battery priority SoC. With `evcc_automatic` it also sets **input_number.predbat_car_charging_solar_min_soc**, but only when the value in evcc changes, so your own adjustments are not undone every poll |
 | `sensor.predbat_evcc_status` | `ok` / `degraded` / `unreachable`, with the evcc version and any missing fields |
 
 #### Mode control (evcc)

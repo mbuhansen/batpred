@@ -88,7 +88,12 @@ class MockEvccAPI(EvccAPI):
         self.count_errors = 0
         self.base = self
         self.plan_valid = True
+        self.config_written = {}
         self.initialize(**kwargs)
+
+    def expose_config(self, name, value, **kwargs):
+        """Record a config write instead of updating a Home Assistant entity."""
+        self.config_written[name] = value
 
     @property
     def now_utc(self):
@@ -640,6 +645,44 @@ async def _immediate(value):
     return value
 
 
+def test_priority_soc():
+    """The home battery priority SoC is taken from evcc's site configuration"""
+    print("**** Running Test: evcc_priority_soc ****")
+    failures = []
+    api = MockEvccAPI(host="http://evcc", automatic=True)
+
+    api.state = {"prioritySoc": 35.0}
+    api.publish_priority_soc()
+    check("published", api.entities["sensor.predbat_evcc_priority_soc"]["state"], 35.0, failures)
+    check("written", api.config_written.get("car_charging_solar_min_soc"), 35.0, failures)
+
+    # Unchanged value must not be written again, so a user editing it in HA is not fought every poll
+    api.config_written.pop("car_charging_solar_min_soc")
+    api.publish_priority_soc()
+    check("no_repeat", "car_charging_solar_min_soc" in api.config_written, False, failures)
+
+    # A change in evcc does win
+    api.state = {"prioritySoc": 50.0}
+    api.publish_priority_soc()
+    check("changed", api.config_written.get("car_charging_solar_min_soc"), 50.0, failures)
+
+    # Nothing usable in the state leaves Predbat's own setting alone
+    for bad in ({}, {"prioritySoc": None}, {"prioritySoc": "abc"}, {"prioritySoc": 150}):
+        api.config_written.clear()
+        api.state = bad
+        check("ignored_{}".format(bad.get("prioritySoc")), api.publish_priority_soc(), None, failures)
+        check("not_written_{}".format(bad.get("prioritySoc")), api.config_written, {}, failures)
+
+    # Without automatic configuration evcc reports the value but does not own it
+    manual = MockEvccAPI(host="http://evcc", automatic=False)
+    manual.state = {"prioritySoc": 20.0}
+    manual.publish_priority_soc()
+    check("manual_published", manual.entities["sensor.predbat_evcc_priority_soc"]["state"], 20.0, failures)
+    check("manual_not_written", manual.config_written, {}, failures)
+
+    return failures
+
+
 def test_evcc(my_predbat=None):
     """
     Run the evcc component tests, returns True on failure
@@ -658,6 +701,7 @@ def test_evcc(my_predbat=None):
         test_publish_and_auto_config,
         test_sticky_soc,
         test_desired_mode_and_gates,
+        test_priority_soc,
         test_override_detection,
         test_apply_modes_writes,
         test_client_http,
