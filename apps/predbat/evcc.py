@@ -377,6 +377,7 @@ class EvccAPI(ComponentBase):
         self.sticky_soc_time = {}
         self.sticky_vehicle = {}
         self.written_mode = {}
+        self.written_priority_soc = None
         self.last_write = {}
         self.override_until = {}
         self.last_connected = {}
@@ -605,6 +606,42 @@ class EvccAPI(ComponentBase):
             self.entity("sensor", "vehicle", car_n), state=vehicle.get("title") or loadpoint.get("vehicleTitle") or "unknown", attributes={"friendly_name": "Predbat evcc vehicle", "icon": "mdi:car", "key": vehicle_key, "connected": connected}, app="evcc"
         )
         self.dashboard_item(self.entity("binary_sensor", "plan_active", car_n), state="on" if loadpoint.get("planActive") else "off", attributes={"friendly_name": "Predbat evcc plan active", "icon": "mdi:calendar-clock"}, app="evcc")
+
+    def publish_priority_soc(self):
+        """
+        Take the home battery priority SoC from evcc's site configuration.
+
+        evcc's prioritySoc is the level below which PV surplus fills the home battery before the car,
+        which is exactly what input_number.predbat_car_charging_solar_min_soc means to the diversion
+        model - so with automatic configuration on, evcc owns it rather than the user keeping two
+        numbers in step by hand. Written only when it changes, so it does not fight the UI every poll.
+        """
+        priority = self.state.get("prioritySoc")
+        try:
+            priority = float(priority)
+        except (TypeError, ValueError):
+            return None
+        if priority < 0 or priority > 100:
+            return None
+
+        self.dashboard_item(
+            self.entity("sensor", "priority_soc", 0),
+            state=dp2(priority),
+            attributes={"friendly_name": "Predbat evcc home battery priority SoC", "unit_of_measurement": "%", "icon": "mdi:home-battery", "state_class": "measurement"},
+            app="evcc",
+        )
+
+        if not self.automatic or not self.solar:
+            return priority
+        # Only on change, so a value the user adjusts in Home Assistant is not overwritten every poll -
+        # evcc wins when evcc's own setting moves, and stays out of the way otherwise
+        if self.written_priority_soc is not None and abs(self.written_priority_soc - priority) < 0.01:
+            return priority
+
+        self.log("EvccAPI: home battery priority SoC {}% from evcc".format(dp2(priority)))
+        self.base.expose_config("car_charging_solar_min_soc", priority)
+        self.written_priority_soc = priority
+        return priority
 
     def publish_status(self, status):
         """Publish the component's own health sensor."""
@@ -856,6 +893,8 @@ class EvccAPI(ComponentBase):
                 except Exception as error:
                     # One malformed loadpoint must not stop the others or the component
                     self.log("Warn: EvccAPI: failed to publish car {}: {}".format(car_n, error))
+
+        self.publish_priority_soc()
 
         signature = self.signature(loadpoints)
         if self.automatic and signature != self.config_signature:

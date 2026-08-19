@@ -477,7 +477,9 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
 - **car_charging_solar_limit** - the SoC (%) the opportunistic solar charging fills the car to, **independent of the grid plan target** (`car_charging_limit`).
   Defaults to `car_charging_limit` when not set. With EVCC this is the loadpoint's limit SoC (its PV cap), while `car_charging_limit` is the departure plan target.
 - **input_number.predbat_car_charging_solar_min_soc** - home battery SoC threshold (%) in Home Assistant. The car only takes solar once the home battery is above this level,
-  mirroring EVCC's priority SoC so the home battery is charged first. Default 0%.
+  so the home battery is charged first. Default 0%. This is yours to set for any charger - with the [evcc component](components.md#evcc-ev-charger-evcc) and
+  `evcc_automatic` on it is taken from evcc's own `prioritySoc` instead, which means the same thing, so the two cannot drift apart. Even then it is only written when
+  the value in evcc changes, so adjusting it in Home Assistant is not undone on the next poll.
 
 ### Setting it up by hand
 
