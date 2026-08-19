@@ -66,6 +66,13 @@ CAR_PLUGGED_RESPONSE = ["on", "true", "yes", "1", "connected", "charging"]
 # Recognised "not plugged in" states, so only a genuinely unrecognised state is worth warning about
 CAR_UNPLUGGED_RESPONSE = ["off", "false", "no", "0", "disconnected", "unavailable", "unknown", "none", ""]
 
+# The charging decision Predbat publishes per car as sensor.<prefix>_car_charging_mode. Solar is the
+# resting state, so a charger that follows the sun keeps doing so - and keeps its own departure plan
+# alive - while off is reserved for a deliberate "do not charge from the surplus"
+CAR_MODE_NOW = "now"
+CAR_MODE_SOLAR = "solar"
+CAR_MODE_OFF = "off"
+
 # Create an array of times in the day in 5-minute intervals
 BASE_TIME = datetime.strptime("00:00:00", "%H:%M:%S")
 OPTIONS_TIME = [((BASE_TIME + timedelta(seconds=minute * 60)).strftime("%H:%M:%S")) for minute in range(0, 24 * 60, 5)]

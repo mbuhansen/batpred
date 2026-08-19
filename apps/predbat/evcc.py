@@ -34,6 +34,7 @@ from component_base import ComponentBase
 from mock_base import MockBase as SharedMockBase
 from predbat_metrics import record_api_call
 from utils import str2time, dp2, dp3
+from const import CAR_MODE_NOW, CAR_MODE_SOLAR
 
 # Modes evcc accepts on POST /api/loadpoints/{id}/mode/{mode}
 EVCC_MODE_OFF = "off"
@@ -680,21 +681,28 @@ class EvccAPI(ComponentBase):
         """
         Work out the evcc mode Predbat wants for a car, returning (mode, reason).
 
-        The decision comes from the two binary sensors publish_car_plan() writes during Predbat's
-        own cycle. A missing charging-slot sensor means Predbat has not planned yet, which must
-        never be read as "off".
+        The decision itself is Predbat's, published as sensor.<prefix>_car_charging_mode during its
+        own cycle - see Output.publish_car_charging_mode - so evcc and a plain Home Assistant
+        automation act on identical logic. This only maps those three states onto evcc's own modes.
+        A missing sensor means Predbat has not planned yet, which must never be read as "off".
+
+        Solar maps to pv (or minpv), and it is the resting state rather than off because off disables
+        the loadpoint in evcc and takes its own departure plan down with it - the plan this component
+        exists to read.
         """
         postfix = self.car_postfix(car_n)
-        slot = self.get_state_wrapper(entity_id="binary_sensor.{}_car_charging_slot{}".format(self.prefix, postfix))
-        if slot is None:
+        entity_id = "sensor.{}_car_charging_mode{}".format(self.prefix, postfix)
+        mode = self.get_state_wrapper(entity_id=entity_id)
+        if mode is None:
             return None, "no_plan_yet"
-        solar = self.get_state_wrapper(entity_id="binary_sensor.{}_car_charging_solar_slot{}".format(self.prefix, postfix))
+        reason = self.get_state_wrapper(entity_id=entity_id, attribute="reason") or str(mode)
 
-        if str(slot).lower() == "on":
-            return EVCC_MODE_NOW, "grid_slot"
-        if str(solar).lower() == "on":
-            return (EVCC_MODE_MINPV if self.use_minpv else EVCC_MODE_PV), "solar"
-        return EVCC_MODE_OFF, "idle"
+        mode = str(mode).lower()
+        if mode == CAR_MODE_NOW:
+            return EVCC_MODE_NOW, reason
+        if mode == CAR_MODE_SOLAR:
+            return (EVCC_MODE_MINPV if self.use_minpv else EVCC_MODE_PV), reason
+        return EVCC_MODE_OFF, reason
 
     def should_write(self, car_n, mode, reason):
         """

@@ -9,6 +9,7 @@
 # pylint: disable=attribute-defined-outside-init
 from prediction import Prediction
 from tests.test_infra import reset_rates2, reset_inverter
+from const import CAR_SOLAR_EXPORT_ALWAYS
 
 
 def build_prediction(my_predbat, pv_amount=0.0, load_amount=1.0):
@@ -156,5 +157,50 @@ def run_car_plugged_state_tests(my_predbat):
             my_predbat.args.pop(key, None)
         else:
             my_predbat.args[key] = value
+
+    return failed
+
+
+def run_car_charging_mode_tests(my_predbat):
+    """
+    Test the charging decision Predbat publishes for an external charger, with or without evcc
+
+    Solar is the resting state so a sun-following charger keeps following the sun (and keeps its own
+    departure plan alive); off is only published when it is a decision - the surplus is worth more
+    exported, or this car does no solar charging at all.
+    """
+    failed = False
+    print("**** Running Car charging mode tests ****")
+
+    saved = {name: getattr(my_predbat, name) for name in ["num_cars", "car_charging_solar", "car_charging_plugged", "car_charging_slots", "car_charging_solar_export_threshold", "rate_export"]}
+    my_predbat.num_cars = 1
+    my_predbat.car_charging_slots = [[]]
+    my_predbat.rate_export = {my_predbat.minutes_now: 10.0}
+
+    # (solar enabled, plugged, export threshold, grid slot now, expected mode, expected reason)
+    cases = [
+        (True, True, CAR_SOLAR_EXPORT_ALWAYS, True, "now", "grid_slot"),
+        (True, True, CAR_SOLAR_EXPORT_ALWAYS, False, "solar", "solar"),
+        # Export beats the cheap charge it would displace - the one case worth turning the charger off for
+        (True, True, 5.0, False, "off", "export_better"),
+        # A grid slot always wins, even when the surplus should be sold
+        (True, True, 5.0, True, "now", "grid_slot"),
+        # Not plugged in is an absence, not a decision - keep the charger following the sun
+        (True, False, CAR_SOLAR_EXPORT_ALWAYS, False, "solar", "idle"),
+        # The car does no solar charging, so there is nothing to leave it in solar for
+        (False, True, CAR_SOLAR_EXPORT_ALWAYS, False, "off", "solar_disabled"),
+    ]
+    for solar, plugged, threshold, slot, expect_mode, expect_reason in cases:
+        my_predbat.car_charging_solar = [solar]
+        my_predbat.car_charging_plugged = [plugged]
+        my_predbat.car_charging_solar_export_threshold = [threshold]
+        solar_allowed, solar_reason = my_predbat.publish_car_solar_slot(0, "")
+        mode, reason = my_predbat.publish_car_charging_mode(0, "", slot, solar_allowed, solar_reason)
+        if (mode, reason) != (expect_mode, expect_reason):
+            print("ERROR: solar {} plugged {} threshold {} slot {} gave ({}, {}), expected ({}, {})".format(solar, plugged, threshold, slot, mode, reason, expect_mode, expect_reason))
+            failed = True
+
+    for name, value in saved.items():
+        setattr(my_predbat, name, value)
 
     return failed

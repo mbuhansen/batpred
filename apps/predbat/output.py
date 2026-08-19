@@ -20,7 +20,7 @@ import math
 import copy
 from datetime import datetime, timedelta
 from config import THIS_VERSION
-from const import TIME_FORMAT, PREDICT_STEP, CAR_SOLAR_EXPORT_ALWAYS
+from const import TIME_FORMAT, PREDICT_STEP, CAR_SOLAR_EXPORT_ALWAYS, CAR_MODE_NOW, CAR_MODE_SOLAR, CAR_MODE_OFF
 from utils import dp0, dp1, dp2, dp3, calc_percent_limit, minute_data, minute_data_state
 from prediction import Prediction
 
@@ -73,30 +73,74 @@ class Output:
 
     def publish_car_solar_slot(self, car_n, postfix):
         """
-        Publish whether solar surplus should be diverted to this car right now.
+        Publish whether solar surplus should be diverted to this car right now, returning (on, reason).
 
         On means the surplus is worth less exported than the charge it displaces, so an external charger
         (e.g. EVCC) should run in its solar/PV mode. Off means sell the surplus instead and let the planned
         grid slots - published as binary_sensor.<prefix>_car_charging_slot - cover the car.
         """
         if not self.car_charging_solar[car_n]:
-            return
+            return False, "solar_disabled"
 
         threshold = self.car_charging_solar_export_threshold[car_n]
         export_rate = self.rate_export.get(self.minutes_now, 0)
         allowed = self.car_charging_plugged[car_n] and export_rate <= threshold
+
+        # Why it is off matters to the caller: only "export_better" is a decision to stop charging from
+        # the surplus, and an external charger should be left following the sun for the other reasons
+        if allowed:
+            reason = "solar"
+        elif not self.car_charging_plugged[car_n]:
+            reason = "not_plugged"
+        else:
+            reason = "export_better"
 
         self.dashboard_item(
             "binary_sensor." + self.prefix + "_car_charging_solar_slot" + postfix,
             state="on" if allowed else "off",
             attributes={
                 "friendly_name": "Predbat divert solar to car" + postfix,
+                "reason": reason,
                 "export_rate": dp2(export_rate),
                 "threshold": None if threshold >= CAR_SOLAR_EXPORT_ALWAYS else dp2(threshold),
                 "plugged_in": self.car_charging_plugged[car_n],
                 "icon": "mdi:solar-power-variant",
             },
         )
+        return allowed, reason
+
+    def publish_car_charging_mode(self, car_n, postfix, slot, solar_allowed, solar_reason):
+        """
+        Publish the single charging decision for this car: charge now, follow the sun, or do not charge.
+
+        This is the decision an external charger should act on, whatever drives it - the evcc component
+        maps it onto evcc's own modes, and a Home Assistant automation can read it directly. It is one
+        sensor rather than two so the three states cannot be combined into something Predbat never meant.
+
+        Solar is the resting state rather than off: off means "do not charge from the sun", which for a
+        charger that has its own departure plan (evcc) takes that plan down with it. Off is therefore
+        reserved for the two cases where it is a decision - the surplus is worth more exported, or this
+        car does not do solar charging at all.
+        """
+        if slot:
+            mode, reason = CAR_MODE_NOW, "grid_slot"
+        elif solar_allowed:
+            mode, reason = CAR_MODE_SOLAR, "solar"
+        elif solar_reason in ("export_better", "solar_disabled"):
+            mode, reason = CAR_MODE_OFF, solar_reason
+        else:
+            mode, reason = CAR_MODE_SOLAR, "idle"
+
+        self.dashboard_item(
+            "sensor." + self.prefix + "_car_charging_mode" + postfix,
+            state=mode,
+            attributes={
+                "friendly_name": "Predbat car charging mode" + postfix,
+                "reason": reason,
+                "icon": "mdi:ev-station",
+            },
+        )
+        return mode, reason
 
     def publish_car_plan(self):
         """
@@ -107,7 +151,8 @@ class Output:
         for car_n in range(self.num_cars):
             if car_n > 0:
                 postfix = "_" + str(car_n)
-            self.publish_car_solar_slot(car_n, postfix)
+            solar_allowed, solar_reason = self.publish_car_solar_slot(car_n, postfix)
+            slot = False
             if not self.car_charging_slots[car_n]:
                 self.dashboard_item(
                     "binary_sensor." + self.prefix + "_car_charging_slot" + postfix,
@@ -131,8 +176,6 @@ class Output:
                 window = self.car_charging_slots[car_n][0]
                 if self.minutes_now >= window["start"] and self.minutes_now < window["end"] and window["kwh"] > 0:
                     slot = True
-                else:
-                    slot = False
 
                 time_format_time = "%H:%M:%S"
                 car_startt = self.midnight_utc + timedelta(minutes=window["start"])
@@ -182,6 +225,8 @@ class Output:
                         "icon": "mdi:home-lightning-bolt-outline",
                     },
                 )
+
+            self.publish_car_charging_mode(car_n, postfix, slot, solar_allowed, solar_reason)
 
     def publish_rates_export(self):
         """
