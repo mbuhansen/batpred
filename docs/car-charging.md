@@ -514,7 +514,11 @@ than the charger actually does.
 The cheapest way to calibrate is to let it run for a couple of sunny days and compare the green car column on the plan against what `car_charging_energy` actually
 recorded. If the model sits high, `car_charging_solar_min_power` or `car_charging_solar_power_step` is usually set too low.
 
-On the [Predbat plan](predbat-plan-card.md), solar diverted to the car is shown in the car column in **green** (as opposed to yellow for planned grid charging).
+On the [Predbat plan](predbat-plan-card.md), the car column is **green** for every slot where the charger is free to divert
+solar - the car is plugged in, there is PV, it has room below its solar limit and the export is not worth more - as opposed
+to yellow for planned grid charging. The figure is what Predbat expects the car to take, and a green slot showing `0` is
+meaningful: the charger may divert, but the surplus is too small to start it (see **car_charging_solar_min_power**). That is
+deliberately distinct from a slot with no sun at all, which stays blank.
 
 ### Selling the surplus instead of putting it in the car
 

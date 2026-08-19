@@ -4292,6 +4292,7 @@ class Plan:
                 self.predict_carbon_best = pred.predict_carbon_best
                 self.predict_clipped_best = pred.predict_clipped_best
                 self.predict_car_solar_best = pred.predict_car_solar_best
+                self.predict_car_solar_possible_best = pred.predict_car_solar_possible_best
 
             if save:
                 self.log(
