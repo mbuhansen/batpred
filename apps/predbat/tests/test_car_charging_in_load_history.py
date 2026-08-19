@@ -103,3 +103,58 @@ def run_car_charging_in_load_history_tests(my_predbat):
         setattr(my_predbat, name, value)
 
     return failed
+
+
+def run_one_plugged(my_predbat, sensor_state, now_response):
+    """Read car_charging_plugged for one sensor state and car_charging_now_response list."""
+    my_predbat.ha_interface.dummy_items["binary_sensor.predbat_evcc_connected"] = sensor_state
+    my_predbat.args["car_charging_plugged"] = ["binary_sensor.predbat_evcc_connected"]
+    my_predbat.args["car_charging_now_response"] = now_response
+    my_predbat.get_car_charging_planned()
+    return my_predbat.car_charging_plugged[0]
+
+
+def run_car_plugged_state_tests(my_predbat):
+    """
+    Test that a plugged-in sensor is read on the standard on/off states, whatever car_charging_now_response holds
+
+    The evcc component points car_charging_plugged at a binary sensor reporting exactly on/off, while
+    car_charging_now_response is written for a charger's own status text - and an unquoted "on" in that
+    YAML list is parsed as a boolean, so matching on it alone leaves the solar diversion silently dead.
+    """
+    failed = False
+    print("**** Running Car plugged state tests ****")
+
+    saved = {name: getattr(my_predbat, name) for name in ["num_cars", "car_charging_plugged"]}
+    saved_args = {key: my_predbat.args.get(key) for key in ["car_charging_plugged", "car_charging_now_response", "num_cars"]}
+    my_predbat.num_cars = 1
+    my_predbat.args["num_cars"] = 1
+
+    # (sensor state, car_charging_now_response, expected)
+    cases = [
+        # The YAML trap: unquoted on/yes/true come back as booleans, so "on" is not in the list at all
+        ("on", ["true", "true", "true", "charging"], True),
+        ("on", ["yes", "on", "true", "charging"], True),
+        ("on", ["charging"], True),
+        ("off", ["yes", "on", "true", "charging"], False),
+        ("off", ["true", "true", "true", "charging"], False),
+        # A charger's own status text still works through car_charging_now_response
+        ("latched", ["latched", "locked"], True),
+        ("waiting", ["latched", "locked"], False),
+        ("unavailable", ["yes", "on"], False),
+    ]
+    for sensor_state, now_response, expected in cases:
+        result = run_one_plugged(my_predbat, sensor_state, now_response)
+        if result != expected:
+            print("ERROR: car_charging_plugged for state '{}' with car_charging_now_response {} was {}, expected {}".format(sensor_state, now_response, result, expected))
+            failed = True
+
+    for name, value in saved.items():
+        setattr(my_predbat, name, value)
+    for key, value in saved_args.items():
+        if value is None:
+            my_predbat.args.pop(key, None)
+        else:
+            my_predbat.args[key] = value
+
+    return failed

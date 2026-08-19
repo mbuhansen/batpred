@@ -32,6 +32,8 @@ from const import (
     LOAD_FORECAST_HISTORY_MAX_DAYS,
     PREDBAT_MAX_CARS,
     CAR_SOLAR_EXPORT_ALWAYS,
+    CAR_PLUGGED_RESPONSE,
+    CAR_UNPLUGGED_RESPONSE,
 )
 from predbat_metrics import metrics
 from futurerate import FutureRate
@@ -2194,7 +2196,12 @@ class Fetch:
             if plugged is None:
                 self.car_charging_plugged[car_n] = self.car_charging_now[car_n]
             elif isinstance(plugged, str):
-                self.car_charging_plugged[car_n] = plugged.lower() in self.car_charging_now_response
+                # Matched on the standard on/true states as well as car_charging_now_response - see
+                # CAR_PLUGGED_RESPONSE for why that list alone cannot be trusted for this sensor
+                state = plugged.lower()
+                self.car_charging_plugged[car_n] = state in self.car_charging_now_response or state in CAR_PLUGGED_RESPONSE
+                if not self.car_charging_plugged[car_n] and state not in CAR_UNPLUGGED_RESPONSE:
+                    self.log("Warn: Car {} plugged-in sensor reports '{}', which is neither a known plugged-in state nor in car_charging_now_response {} - treating the car as unplugged".format(car_n, plugged, self.car_charging_now_response))
             else:
                 self.car_charging_plugged[car_n] = bool(plugged)
 
