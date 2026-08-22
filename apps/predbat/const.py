@@ -52,6 +52,16 @@ MINUTE_WATT = 60 * 1000
 # which increases the cost of the plan over the full rate charge the planner costed the window at.
 LOW_POWER_PV_THRESHOLD = 0.1
 
+# Fraction of the peak forecast PV power above which a plan_interval_minutes bucket is classed as
+# "light" rather than "dark" when deciding where to split a charge window (calc_dawn). A charge window
+# otherwise built from a single long cheap-rate period spanning sunrise would apply LOW_POWER_PV_THRESHOLD
+# across the whole thing and abandon low power charging even for the still-dark hours before the sun is
+# up (#4557) - splitting at dawn keeps the dark portion as its own window, genuinely PV-free, so it stays
+# throttled. A fraction of that forecast's own peak, rather than a fixed Watts figure, scales with the
+# site - a fixed threshold picked for a typical system would be noise-level for a large array and
+# unreachable for a small one.
+LOW_POWER_PV_LIGHT_FRACTION = 0.1
+
 INVERTER_TEST = False  # Run inverter control self test
 
 # Export rate above which solar is never diverted to the car. The default means "no limit" - solar is always
@@ -67,11 +77,24 @@ CAR_PLUGGED_RESPONSE = ["on", "true", "yes", "1", "connected", "charging"]
 CAR_UNPLUGGED_RESPONSE = ["off", "false", "no", "0", "disconnected", "unavailable", "unknown", "none", ""]
 
 # The charging decision Predbat publishes per car as sensor.<prefix>_car_charging_mode. Solar is the
-# resting state, so a charger that follows the sun keeps doing so - and keeps its own departure plan
-# alive - while off is reserved for a deliberate "do not charge from the surplus"
+# resting state, so a charger left alone keeps following the sun and still charges if Predbat stops
+# publishing, while off is reserved for a deliberate "do not charge from the surplus"
 CAR_MODE_NOW = "now"
 CAR_MODE_SOLAR = "solar"
 CAR_MODE_OFF = "off"
+# Ceiling on how many what-if predictions plan_car_charging_scored may run for one car. Each is a full
+# forecast, so a big car with many short windows could otherwise spend seconds here; past the budget the
+# remaining energy falls back to the price-sorted pass, which is the pre-scoring behaviour.
+CAR_SCORE_MAX_PREDICTIONS = 250
+# Sentinel values for an export window's target SoC/limit (export_limits_best and friends).
+# A real target is any value below EXPORT_LIMIT_FREEZE, expressed as a percentage 0-100
+# (see calc_percent_limit) with the fractional part sometimes encoding a low-power export rate.
+# prediction_kernel.cpp hardcodes the same two literals independently (it can't import this
+# file) - unlike PREDBAT_MAX_CARS/PK_MAX_CARS above, they aren't yet named there too, so a value
+# change here needs the matching literals found and updated by hand, in lockstep with a parity
+# revision bump and a rebuild of all platform binaries.
+EXPORT_LIMIT_FREEZE = 99.0  # Hold SoC, export only genuine PV surplus - no forced discharge
+EXPORT_LIMIT_IDLE = 100.0  # Export window disabled entirely
 
 # Create an array of times in the day in 5-minute intervals
 BASE_TIME = datetime.strptime("00:00:00", "%H:%M:%S")

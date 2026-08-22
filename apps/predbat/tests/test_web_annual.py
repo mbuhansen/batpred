@@ -11,6 +11,7 @@
 
 import asyncio
 import builtins
+import calendar
 import copy
 import json
 import re
@@ -1184,6 +1185,69 @@ def test_web_annual_form(my_predbat):
     return failed
 
 
+def test_web_annual_fast_mode(my_predbat):
+    """The fast mode checkbox renders, round-trips, and interpolated months are marked."""
+    failed = False
+    print("**** Testing annual web tab fast mode ****")
+    page = make_page(my_predbat)
+
+    print("Test: the Advanced block offers a fast mode checkbox")
+    form = page.render_form(dict(DEFAULT_CONFIG))
+    if 'name="fast_mode"' not in form:
+        print("  ERROR: the form should contain a fast_mode checkbox")
+        failed = True
+
+    print("Test: a ticked box round-trips into the config")
+    postdata = valid_postdata()
+    postdata["fast_mode"] = "on"
+    config = page.config_from_post(postdata)
+    if config.get("fast_mode") is not True:
+        print("  ERROR: a ticked fast_mode box should set fast_mode True, got {!r}".format(config.get("fast_mode")))
+        failed = True
+
+    print("Test: an absent box means off")
+    # A checkbox absent from postdata means unchecked - there is no "off" value to read.
+    config = page.config_from_post(valid_postdata())
+    if config.get("fast_mode") is not False:
+        print("  ERROR: an absent fast_mode box should set fast_mode False, got {!r}".format(config.get("fast_mode")))
+        failed = True
+
+    print("Test: an interpolated month renders as interpolated, not unavailable")
+    results = sample_run_results()
+    first = results["months"][0]
+    results["months"][0] = {
+        "month": first["month"],
+        "status": "interpolated",
+        "days": first["days"],
+        "standing_charge_p": first["standing_charge_p"],
+        "scenarios": first["scenarios"],
+        "interpolated_from": {"anchors": [3, 6, 9, 12], "basis": "solar_affine"},
+    }
+    table = page._render_month_table(results)
+    name = calendar.month_abbr[first["month"]]
+    cell = table.split(name, 1)[1][:400] if name in table else ""
+    if "unavailable" in cell:
+        print("  ERROR: an interpolated month must not render as unavailable")
+        failed = True
+    if "interpolated" not in table.lower():
+        print("  ERROR: an interpolated month should be labelled as such")
+        failed = True
+
+    print("Test: an interpolated month is charted rather than dropped")
+    chart = page._render_chart(results)
+    if name not in chart:
+        print("  ERROR: an interpolated month should appear in the chart categories")
+        failed = True
+
+    print("Test: the run details table reports fast mode")
+    details = page._render_run_details({"config": {"fast_mode": True, "samples_per_month": 2}, "annual": {"fast_mode": True, "months_interpolated": 8}})
+    if "Fast mode" not in details:
+        print("  ERROR: 'what this run used' should report fast mode")
+        failed = True
+
+    return failed
+
+
 def test_web_annual_terminal_state(my_predbat):
     """Verify a finished job is claimed exactly once and never re-reports as complete.
 
@@ -1421,10 +1485,10 @@ def test_web_annual_store_failure_surfaces(my_predbat):
 def sample_run_results():
     """Return a results document covering an ok, a degraded and an unavailable month."""
     scenarios = {
-        "no_pvbat": {"cost_p": 18000.0, "import_kwh": 400.0, "export_kwh": 0.0, "pv_generated_kwh": 0.0, "battery_throughput_kwh": 0.0, "export_credit_p_estimate": 0.0},
-        "pv_only": {"cost_p": 13000.0, "import_kwh": 340.0, "export_kwh": 70.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 0.0, "export_credit_p_estimate": 210.0},
-        "without_predbat": {"cost_p": 9000.0, "import_kwh": 300.0, "export_kwh": 20.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 90.0, "export_credit_p_estimate": 300.0},
-        "with_predbat": {"cost_p": 6600.0, "import_kwh": 280.0, "export_kwh": 145.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 140.0, "export_credit_p_estimate": 675.0},
+        "no_pvbat": {"cost_p": 18000.0, "import_kwh": 400.0, "export_kwh": 0.0, "pv_generated_kwh": 0.0, "battery_throughput_kwh": 0.0, "battery_cycles": 0.0, "export_credit_p_estimate": 0.0},
+        "pv_only": {"cost_p": 13000.0, "import_kwh": 340.0, "export_kwh": 70.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 0.0, "battery_cycles": 0.0, "export_credit_p_estimate": 210.0},
+        "without_predbat": {"cost_p": 9000.0, "import_kwh": 300.0, "export_kwh": 20.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 90.0, "battery_cycles": 2.0, "export_credit_p_estimate": 300.0},
+        "with_predbat": {"cost_p": 6600.0, "import_kwh": 280.0, "export_kwh": 145.0, "pv_generated_kwh": 120.0, "battery_throughput_kwh": 140.0, "battery_cycles": 3.0, "export_credit_p_estimate": 675.0},
     }
     return {
         "year": 2025,
@@ -1486,6 +1550,14 @@ def test_web_annual_results(my_predbat):
         failed = True
     if "24.00" not in html:
         print("  ERROR: the Predbat saving (2400p = £24.00) should be shown")
+        failed = True
+
+    print("Test: the battery cycle metric appears in the payback table")
+    if "<th>Battery cycles a year</th>" not in html:
+        print("  ERROR: expected the Battery cycles column header in the rendered HTML, got:\n{}".format(html))
+        failed = True
+    if "3.00 (+1.00)" not in html:
+        print("  ERROR: expected the with Predbat battery cycles value (3.00 (+1.00)) in the rendered HTML, got:\n{}".format(html))
         failed = True
 
     print("Test: the validated colourblind-safe palette is used, not the house trio")

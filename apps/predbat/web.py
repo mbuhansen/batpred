@@ -69,7 +69,7 @@ from web_helper import (
     get_dashboard_collapsible_js,
 )
 
-from utils import calc_percent_limit, str2time, dp0, dp2, dp4, format_time_ago, get_override_time_from_string, history_attribute, prune_today
+from utils import calc_percent_limit, str2time, dp0, dp2, dp4, format_time_ago, get_override_time_from_string, history_attribute, prune_today, mask_secret_args
 from const import TIME_FORMAT, TIME_FORMAT_DAILY, TIME_FORMAT_HA
 from predbat import THIS_VERSION
 from component_base import ComponentBase
@@ -454,6 +454,7 @@ class WebInterface(ComponentBase):
         app.router.add_get("/debug_yaml", self.html_debug_yaml)
         app.router.add_get("/debug_log", self.html_debug_log)
         app.router.add_get("/debug_apps", self.html_debug_apps)
+        app.router.add_get("/debug_apps_live", self.html_debug_apps_live)
         app.router.add_get("/debug_plan", self.html_debug_plan)
         app.router.add_get("/compare", self.html_compare)
         app.router.add_post("/compare", self.html_compare_post)
@@ -475,6 +476,7 @@ class WebInterface(ComponentBase):
         app.router.add_post("/api/login", self.html_api_login)
         app.router.add_get("/browse", self.html_browse)
         app.router.add_get("/download", self.html_download_file)
+        app.router.add_get("/images/{filename}", self.html_logo_image)
         app.router.add_get("/internals", self.html_internals)
         app.router.add_get("/api/internals", self.html_api_internals)
         app.router.add_get("/api/internals/download", self.html_api_internals_download)
@@ -872,7 +874,7 @@ class WebInterface(ComponentBase):
         text += '<div style="flex: 1;">\n'
         text += "<h2>Debug</h2>\n"
         text += "<table>\n"
-        text += "<tr><td>Download</td><td><a href='./debug_apps'>apps.yaml</a></td></tr>\n"
+        text += "<tr><td>Download</td><td><a href='javascript:void(0)' onclick='downloadLiveApps()'>apps.yaml (live)</a> | <a href='./debug_apps'>apps.yaml (file)</a></td></tr>\n"
         text += "<tr><td>Create</td><td><a href='./debug_yaml'>predbat_debug.yaml</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_log'>predbat.log</a></td></tr>\n"
         text += "<tr><td>Download</td><td><a href='./debug_plan'>predbat_plan.html</a></td></tr>\n"
@@ -1677,6 +1679,10 @@ var width = window.innerWidth;
 var height = window.innerHeight;
 width = width / 3 * 2;
 height = height / 3 * 2;
+
+if (width < 600) {
+    width = 600
+}
 
 if (height * 1.68 > width) {
    height = width / 1.68;
@@ -2798,6 +2804,22 @@ chart.render();
 
     async def html_debug_apps(self, request):
         return await self.html_file_load("apps.yaml", as_file="apps.yaml.txt")
+
+    async def html_debug_apps_live(self, request):
+        """
+        Return an apps.yaml reconstructed from the live in-memory settings (self.args).
+
+        Defaults to masking credential-like keys (see mask_secret_args) so a direct or
+        copied request never leaks secrets without an explicit opt-in; pass ?masked=0
+        to download the full unmasked file.
+        """
+        masked = request.query.get("masked", "1") != "0"
+        args_copy = mask_secret_args(self.args) if masked else copy.deepcopy(self.args)
+        yaml = YAML()
+        buf = StringIO()
+        yaml.dump({ROOT_YAML_KEY: args_copy}, buf)
+        filename = "apps_live_masked.yaml.txt" if masked else "apps_live.yaml.txt"
+        return await self.html_file(filename, buf.getvalue())
 
     async def html_debug_plan(self, request):
         html_plan = self.get_state_wrapper(entity_id=self.prefix + ".plan_html", attribute="html", default="<p>No plan available</p>")
@@ -5189,6 +5211,34 @@ document.addEventListener('DOMContentLoaded', function() {
         except Exception as e:
             self.log(f"Error downloading file: {str(e)}")
             return web.Response(text=f"Error downloading file: {str(e)}", status=500)
+
+    async def html_logo_image(self, request):
+        """
+        Serve the bundled Predbat logo images locally.
+
+        The logos used to be loaded from raw.githubusercontent.com, which left the
+        dashboard hanging for ~15s whenever GitHub was unreachable or rate-limiting
+        (issue #4562). They now ship alongside the other app files so the page never
+        depends on internet access to render.
+        """
+        content_types = {
+            "bat_logo.svg": "image/svg+xml",
+            "bat_logo_light.png": "image/png",
+            "bat_logo_dark.png": "image/png",
+        }
+        filename = request.match_info.get("filename")
+        content_type = content_types.get(filename)
+        if not content_type:
+            return web.Response(text="Not found", status=404)
+
+        file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+        try:
+            with open(file_path, "rb") as handle:
+                content = handle.read()
+        except OSError:
+            return web.Response(text="Not found", status=404)
+
+        return web.Response(body=content, content_type=content_type, headers={"Cache-Control": "public, max-age=604800"})
 
     async def html_metrics_dashboard(self, request):
         """

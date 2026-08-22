@@ -814,6 +814,46 @@ When **deye_automatic** is set to `true`, Predbat will discover every battery in
 
 See [Components - DEYE Cloud API](components.md#deye-cloud-api-deye) for full details.
 
+### Sunsynk Cloud API
+
+**EXPERIMENTAL:** Nobody on the Predbat project has a Sunsynk account, so this integration's wire format is inferred from third-party open-source clients rather than documented, and every request/response is traced to the log by default so a tester can capture evidence for an issue report.
+
+Predbat includes support for Sunsynk (DEYE-family) hybrid inverters via the Sunsynk Connect cloud API, providing direct cloud-based monitoring and, once confirmed against your own hardware, battery control - no local Modbus/RS485 access is required.
+
+#### Sunsynk Cloud Configuration
+
+Add your Sunsynk Connect account e-mail and password (the same login used by the Sunsynk phone app) to your `apps.yaml`:
+
+```yaml
+  sunsynk_username: 'you@example.com'
+  sunsynk_password: 'your-password'
+  sunsynk_region: 'sunsynk'
+  sunsynk_automatic: true
+  sunsynk_control_enable: true
+```
+
+**Note:** It's strongly recommended to store `sunsynk_username` and `sunsynk_password` in `secrets.yaml` and reference them as `!secret sunsynk_username` etc - see [Storing secrets](#storing-secrets).
+
+**Configuration options:**
+
+- `sunsynk_username` - Your Sunsynk Connect account e-mail address
+- `sunsynk_password` - Your Sunsynk Connect account password
+- `sunsynk_region` - The API region your account is registered in: `'sunsynk'` (default, `api.sunsynk.net`) or `'inteless'` (`pv.inteless.com`)
+- `sunsynk_auth_method` - The login flow: `'password'` (default, RSA-encrypted login), `'password_legacy'` (the pre-2025 plaintext login, opt-in for regions that still serve it) or `'oauth'` (Predbat.com injects and refreshes the token)
+- `sunsynk_inverter_sn` - Optional, restrict Predbat to specific inverter serial number(s) - a single string or a list. Default is all inverters found on the account
+- `sunsynk_automatic` - Set to `true` to automatically configure Predbat entities (recommended, default: `false`)
+- `sunsynk_automatic_ignore_pv` - Optional, defaults to `false`. When `automatic` is enabled, set to `true` to prevent Sunsynk Cloud from overwriting the `pv_power` config
+- `sunsynk_control_enable` - Allow Predbat to write charge/export schedules to the inverter (default: `true`, set to `false` for monitoring only)
+- `sunsynk_battery_nominal_voltage` - Optional override for the battery pack's nominal voltage, only needed if it cannot be inferred from the reported charge target
+
+`sunsynk_auth_method: 'password'` never automatically falls back to `'password_legacy'` - if the RSA login fails, retry with `password_legacy` deliberately rather than have Predbat silently send your password in plaintext. `password_legacy` is still sent over TLS, but without the additional RSA encryption layer, so only choose it for a region whose API still serves the older login.
+
+Settings changes reach the inverter via the dongle's next poll, typically one to five minutes after Predbat writes them. Using the Sunsynk phone app while Predbat is running can overwrite Predbat's settings, and vice versa - there is a single whole-object write endpoint, so the last writer wins.
+
+When **sunsynk_automatic** is set to `true`, Predbat will discover every inverter registered against your Sunsynk Connect account and automatically create and configure all required sensors and schedule control entities for each one - no manual entity configuration is required.
+
+See [Components - Sunsynk Cloud API](components.md#sunsynk-cloud-api-sunsynk) for full details, and [Sunsynk Cloud setup](inverter-setup.md#sunsynk-cloud) for the diagnostics CLI walkthrough.
+
 ### num_inverters
 
 The number of inverters you have. If you increase this above 1 you must provide multiple of each of the inverter entities
@@ -1150,9 +1190,11 @@ Global setting, defaults to `true`.
 
 Controls the way Predbat models your inverter, this does not change the way it is controlled.
 
-During a force export period if the generated solar exceeds the inverter limit or the export limit then the inverter will scale back the export rate.
-If this setting is `true` then the inverter is able to charge the battery from excess PV while still in Force Export mode.
+During a force export **or freeze export** period, if the generated solar exceeds the inverter limit or the export limit then the inverter will scale back the export rate.
+If this setting is `true` then the inverter is able to charge the battery from excess PV while still in Force Export or Freeze Export mode.
 If this setting is `false` then the inverter will not charge the battery and the excess PV will be lost.
+
+For Freeze Export specifically, this means the battery still holds its SoC flat while the export limit alone can absorb all the surplus solar - it only starts charging once solar genuinely exceeds what load and the export limit together can use, matching how many hybrid inverters actually behave (e.g. FoxESS's "Feed-in First" mode prioritises house load, then export, then the battery).
 
 ## Controlling the Inverter
 
@@ -1772,7 +1814,7 @@ whether you are within an Octopus Energy "smart charge" slot
 - **car_charging_battery_size** - Car battery size in kWh
 - **car_charging_limit** - Percentage limit the car is set to charge to
 - **car_charging_soc** - Car's current charge level expressed as a percentage
-- **car_charging_solar** - Per-car flag to model opportunistic (sun-following) charging done by any external charger that follows the PV surplus itself (Zappi ECO+, Wallbox Eco-Smart, evcc, ...); modelling only, no grid charging is planned. Independent of the [evcc component](components.md#evcc-ev-charger-evcc), which only fills these keys in for you. See [Opportunistic solar charging](car-charging.md#opportunistic-solar-sun-following-charging)
+- **car_charging_solar** has moved to Home Assistant - it is **switch.predbat_car_charging_solar** (one per car, see [customisation](customisation.md)), not an apps.yaml key. The remaining `car_charging_solar_*` keys below describe the charger itself and stay here
 - **car_charging_plugged** - Optional per-car sensor indicating the car is plugged in over the forecast horizon (falls back to car_charging_now)
 - **car_charging_solar_max_power** - Maximum solar diversion power in kW (defaults to the configured car charging rate, uncapped for 3-phase chargers)
 - **car_charging_solar_min_power** - Minimum power in kW before the charger will start diverting solar (e.g. 3-phase 6A)

@@ -118,6 +118,7 @@ digestmod
 dimport
 dischargeenergytotal
 dischargefreeze
+Dischg
 diverter
 dlimit
 dnoregion
@@ -129,6 +130,7 @@ Easee
 eauth
 Eddi
 elif
+elinter
 EMEA
 emqx
 emszzzz
@@ -153,6 +155,7 @@ enphaseenergy
 Enpower
 entrez
 epod
+etoday
 etok
 euids
 evcc
@@ -231,6 +234,7 @@ idxs
 iflux
 importlimit
 inday
+inteless
 INTELLI
 intelligentdevice
 interp
@@ -297,6 +301,8 @@ meterpower
 metricb
 metricmid
 microinverters
+middlebox
+middleboxes
 minb
 minmax
 minpv
@@ -326,6 +332,8 @@ mtok
 mult
 myenergi
 mypy
+nanmean
+nanstd
 nattribute
 ncalls
 nearr
@@ -340,6 +348,7 @@ nordpool
 noreferrer
 nosc
 nosuchrun
+notsn
 nrgheat
 numpy
 OCPP
@@ -453,6 +462,7 @@ sess
 setattr
 setdefault
 SFMB
+SIGALRM
 sigcloud
 sigen
 sigencloud
@@ -472,6 +482,8 @@ sofar
 SolarEdge
 solarman
 solarnet
+solarsynk
+solarsynkv
 Solax
 solaxcloud
 solaxmodbus
@@ -481,6 +493,7 @@ solisx
 sourcery
 Southwell
 sparkline
+spki
 springfall
 starthour
 startminute
@@ -498,6 +511,7 @@ substep
 sunspec
 sunsynk
 supabase
+synkctl
 syscmd
 tabindex
 tasmota
@@ -530,6 +544,7 @@ trapz
 Trefor
 treforsiphone
 treforsouthwell
+triggerable
 tunables
 twinx
 typecode
@@ -537,6 +552,7 @@ typecodes
 tzfile
 tzpath
 unconfigured
+underivable
 undiscounted
 unnormalised
 unparseable
@@ -545,9 +561,11 @@ unpickles
 unpushed
 unsmoothed
 unstaged
+urandom
 urlsafe
 useid
 userinterface
+Vallery
 varh
 venv
 Victron

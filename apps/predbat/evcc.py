@@ -51,10 +51,10 @@ GO_ZERO_TIME_PREFIX = "0001-01-01"
 EVCC_WEEKDAY_LOOKAHEAD_DAYS = 8
 
 # Predbat's car_charging_plan_time is a time of day wrapped into a single 24h window by
-# car_plan_bounds(), so a plan further out than this cannot be represented
+# car_ready_minutes(), so a plan further out than this cannot be represented
 PLAN_HORIZON_HOURS = 24
 
-# Values that mean "no override" when published as a Predbat sensor, matching parse_car_available_from
+# Values that mean "no override" when published as a Predbat sensor, matching parse_car_ready_time
 NO_PLAN = "off"
 
 
@@ -162,7 +162,7 @@ def plan_time_to_ready(plan_dt, now, local_tz):
     Map a plan datetime onto Predbat's time-of-day ready time, or NO_PLAN when it cannot be used.
 
     Returns NO_PLAN for a missing plan, a plan already in the past, and a plan more than
-    PLAN_HORIZON_HOURS out - car_plan_bounds() wraps a time of day into a single 24 hour window,
+    PLAN_HORIZON_HOURS out - car_ready_minutes() wraps a time of day into a single 24 hour window,
     so a plan several days away would otherwise be read as "needed tomorrow".
     """
     if plan_dt is None:
@@ -378,6 +378,7 @@ class EvccAPI(ComponentBase):
         self.sticky_vehicle = {}
         self.written_mode = {}
         self.written_priority_soc = None
+        self.written_solar_enabled = {}
         self.last_write = {}
         self.override_until = {}
         self.last_connected = {}
@@ -700,13 +701,31 @@ class EvccAPI(ComponentBase):
             self.auto_set("car_charging_now", per_car("binary_sensor", "charging"))
 
         if self.solar:
-            self.auto_set("car_charging_solar", [car_n in self.loadpoint_map for car_n in range(count)])
+            self.publish_solar_enabled(count)
             self.auto_set("car_charging_solar_limit", per_car("sensor", "limit_soc"))
             self.auto_set("car_charging_solar_max_power", per_car("sensor", "max_power"))
             self.auto_set("car_charging_solar_min_power", per_car("sensor", "min_power"))
             self.auto_set("car_charging_solar_power_step", per_car("sensor", "power_step"))
 
         self.log("EvccAPI: auto-configured {} car(s) from evcc{}".format(len(cars), " (left alone: {})".format(self.overridden_keys) if self.overridden_keys else ""))
+
+    def publish_solar_enabled(self, count):
+        """
+        Turn the per-car solar charging switch on for the cars evcc actually drives a loadpoint for.
+
+        car_charging_solar is a Home Assistant switch rather than an apps.yaml key, so this writes it
+        the way publish_priority_soc writes the priority SoC: only when evcc's own answer changes, so a
+        user who turns the switch off in Home Assistant is not overruled on the next poll. evcc wins
+        again when its topology moves - a loadpoint appearing or going away.
+        """
+        for car_n in range(count):
+            wired = car_n in self.loadpoint_map
+            if self.written_solar_enabled.get(car_n) == wired:
+                continue
+            self.written_solar_enabled[car_n] = wired
+            key = "car_charging_solar" + self.car_postfix(car_n)
+            self.log("EvccAPI: car {} solar charging {} from evcc".format(car_n, "on" if wired else "off"))
+            self.base.expose_config(key, wired)
 
     def signature(self, loadpoints):
         """Build a signature of the evcc topology, so auto-config re-runs when it changes."""
@@ -723,9 +742,11 @@ class EvccAPI(ComponentBase):
         automation act on identical logic. This only maps those three states onto evcc's own modes.
         A missing sensor means Predbat has not planned yet, which must never be read as "off".
 
-        Solar maps to pv (or minpv), and it is the resting state rather than off because off disables
-        the loadpoint in evcc and takes its own departure plan down with it - the plan this component
-        exists to read.
+        Solar maps to pv (or minpv), and it is the resting state rather than off. off is safe for the
+        loadpoint's own departure plan - evcc keeps it, still reports it here, and it stays editable;
+        it only stops evcc acting on it itself, which Predbat is doing anyway through now. The reason
+        to rest in pv is what happens when Predbat is not publishing at all: a loadpoint left in pv
+        still charges from the sun, where one left off would sit idle until Predbat came back.
         """
         postfix = self.car_postfix(car_n)
         entity_id = "sensor.{}_car_charging_mode{}".format(self.prefix, postfix)

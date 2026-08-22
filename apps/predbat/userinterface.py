@@ -19,7 +19,7 @@ service calls) to the appropriate handlers.
 
 import os
 from datetime import timedelta
-from utils import get_override_time_from_string
+from utils import get_override_time_from_string, mask_secret_args
 import json
 import yaml
 import re
@@ -774,11 +774,7 @@ class UserInterface:
                     pass
                 else:
                     if key == "args":
-                        # Remove keys from args
-                        debug[key] = copy.deepcopy(self.__dict__[key])
-                        for sub_key in debug[key]:
-                            if ("_key" in sub_key.lower()) or ("password" in sub_key.lower()):
-                                debug[key][sub_key] = "xxx"
+                        debug[key] = mask_secret_args(self.__dict__[key])
                     else:
                         debug[key] = self.__dict__[key]
         inverters_debug = []
@@ -879,11 +875,19 @@ class UserInterface:
     async def trigger_callback(self, service_data):
         """
         Trigger a callback for a service via HA Interface
+
+        Returns True if a matching listener was found and run, False otherwise - callers
+        (e.g. HAInterface.call_service()'s loopback branch) use this as the success signal
+        for the same True/success, False/None-failure contract the websocket branch provides,
+        since loopback mode only ever simulates the entity-control services in EVENT_LISTEN_LIST,
+        not arbitrary third-party integration services.
         """
         for item in self.EVENT_LISTEN_LIST:
             if item["domain"] == service_data.get("domain", "") and item["service"] == service_data.get("service", ""):
                 # self.log("Trigger callback for {} {}".format(item["domain"], item["service"]))
                 await item["callback"](item["service"], service_data, None)
+                return True
+        return False
 
     def define_service_list(self):
         self.SERVICE_REGISTER_LIST = [

@@ -14,6 +14,11 @@ import sys
 import glob
 import argparse
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from predbat import PredBat
 from tests.test_infra import TestHAInterface
 from tests.test_compute_metric import run_compute_metric_tests
@@ -22,6 +27,7 @@ from tests.test_performance_tweaks import run_performance_tweaks_tests
 from tests.test_perf import run_perf_test
 from tests.test_model import run_model_tests
 from tests.test_predict_pv_power import run_predict_pv_power_tests
+from tests.test_dashboard_device_class import test_dashboard_device_class
 from tests.test_kernel_parity import run_kernel_parity_tests, run_model_kernel_tests
 from tests.test_prediction_batch import run_prediction_batch_tests
 from tests.test_kernel_static_cache import run_kernel_static_cache_tests
@@ -49,6 +55,7 @@ from tests.test_optimise_swap_export import run_optimise_swap_export_tests
 from tests.test_nordpool import run_nordpool_test
 from tests.test_futurerate_auto import test_futurerate_auto
 from tests.test_car_charging_smart import run_car_charging_smart_tests
+from tests.test_car_charging_scored import run_car_charging_scored_tests
 from tests.test_evcc import test_evcc
 from tests.test_car_charging_in_load_history import run_car_charging_in_load_history_tests, run_car_plugged_state_tests, run_car_charging_mode_tests, run_car_solar_possible_tests
 from tests.test_plugin_startup import test_plugin_startup_order
@@ -66,7 +73,18 @@ from tests.test_alert_feed import test_alert_feed
 from tests.test_solax import run_solax_tests
 from tests.test_sigenergy import run_sigenergy_tests
 from tests.test_single_debug import run_single_debug
-from tests.test_saving_session import test_saving_session, test_saving_session_null_octopoints, test_saving_session_notify_config, test_saving_session_default_rate, test_saving_session_axle_conflict, test_saving_session_auto_join_toggle
+from tests.test_saving_session import (
+    test_saving_session,
+    test_saving_session_null_octopoints,
+    test_saving_session_notify_config,
+    test_saving_session_default_rate,
+    test_saving_session_axle_conflict,
+    test_saving_session_join_service_fallback,
+    test_trigger_callback_success_signal,
+    test_saving_session_auto_join_toggle,
+    test_saving_session_custom_entity_no_rewrite_match,
+    test_saving_session_entity_regex_power_rename,
+)
 from tests.test_secrets import run_secrets_tests
 from tests.test_ge_cloud import test_ge_cloud
 from tests.test_teslemetry import test_teslemetry
@@ -84,7 +102,7 @@ from tests.test_history_chunking import run_history_chunking_tests
 from tests.test_web_if import run_test_web_if
 from tests.test_web_chart_currency import test_rates_chart_series_names_use_currency_symbol
 from tests.test_metrics_dashboard_soc_refresh import test_soc_chart_center_text_reads_live_data
-from tests.test_web_functions import run_web_functions_tests
+from tests.test_web_functions import run_web_functions_tests, run_web_logo_image_tests
 from tests.test_web_history_table import run_web_history_table_tests
 from tests.test_web_charts import run_web_charts_tests
 from tests.test_web_chart_grouping import run_web_chart_grouping_tests
@@ -92,6 +110,7 @@ from tests.test_web_entity_unit_resolution import run_web_entity_unit_resolution
 from tests.test_web_annual import (
     test_web_annual,
     test_web_annual_error_isolation,
+    test_web_annual_fast_mode,
     test_web_annual_form,
     test_web_annual_pages,
     test_web_annual_plan_route,
@@ -115,6 +134,7 @@ from tests.test_manual_select import run_test_manual_select
 from tests.test_minute_array import test_minute_array
 from tests.test_minute_data import test_minute_data, test_minute_data_load, test_minute_data_no_smoothing_backwards, test_minute_data_no_smoothing_forward
 from tests.test_minute_data_import_export import test_minute_data_import_export
+from tests.test_faq_recorder_config import test_faq_recorder_config
 from tests.test_minute_data_state import test_minute_data_state
 from tests.test_minute_data_copy import run_minute_data_copy_tests
 from tests.test_format_time_ago import test_format_time_ago
@@ -159,6 +179,13 @@ from tests.test_deye_oauth import run_deye_oauth_tests
 from tests.test_deye_control import run_deye_control_tests
 from tests.test_deye_publish import run_deye_publish_tests
 from tests.test_deye_storage import run_deye_storage_tests
+from tests.test_sunsynk_const import run_sunsynk_const_tests
+from tests.test_sunsynk_auth import run_sunsynk_auth_tests
+from tests.test_sunsynk_api import run_sunsynk_api_tests
+from tests.test_sunsynk_control import run_sunsynk_control_tests
+from tests.test_sunsynk_publish import run_sunsynk_publish_tests
+from tests.test_sunsynk_storage import run_sunsynk_storage_tests
+from tests.test_sunsynk_config import run_sunsynk_config_tests
 from tests.test_enphase_api import run_enphase_api_tests
 from tests.test_solcast import run_solcast_tests
 from tests.test_open_meteo import run_open_meteo_tests
@@ -168,6 +195,7 @@ from tests.test_annual_load import test_annual_load, test_annual_load_octopus
 from tests.test_annual_weather import test_annual_weather
 from tests.test_annual_tariff import test_annual_tariff
 from tests.test_rate_add_io_slots import run_rate_add_io_slots_tests
+from tests.test_iog_charge_skew import run_iog_charge_skew_tests
 from tests.test_battery_curve_keys import run_battery_curve_keys_tests
 from tests.test_balance_inverters import run_balance_inverters_tests
 from tests.test_octopus_download_rates import test_octopus_download_rates_wrapper
@@ -216,10 +244,12 @@ from tests.test_load_today_comparison import test_load_today_comparison
 from tests.test_annual_config import test_annual_config
 from tests.test_annual_bootstrap import test_annual_bootstrap
 from tests.test_annual_sampling import test_annual_sampling
+from tests.test_annual_interpolate import test_annual_fast_mode_assembly, test_annual_interpolate
+from tests.test_annual_curve_reference import test_annual_curve_reference
 from tests.test_annual_scenarios import test_annual_scenarios
 from tests.test_annual_results import test_annual_results
 from tests.test_annual_integration import test_annual_integration
-from tests.test_annual_cli import test_annual_cli, test_annual_cli_machine, test_annual_cli_machine_end_to_end
+from tests.test_annual_cli import test_annual_cli, test_annual_cli_fast_flag, test_annual_cli_machine, test_annual_cli_machine_end_to_end
 from tests.test_annual_job import test_annual_job
 from tests.test_tariff_catalogue import test_tariff_catalogue
 from tests.test_annual_store import test_annual_store
@@ -318,6 +348,7 @@ def main():
         ("perf", run_perf_test, "Performance tests", False),
         ("model", run_model_tests, "Model tests", False),
         ("predict_pv_power", run_predict_pv_power_tests, "predict_pv_power plan-interval scaling tests", False),
+        ("dashboard_device_class", test_dashboard_device_class, "Dashboard sensor device_class regression tests (#3352)", False),
         ("model_kernel", run_model_kernel_tests, "Model tests run with the C++ prediction kernel enabled", False),
         ("kernel_parity", run_kernel_parity_tests, "C++ prediction kernel vs Python engine parity tests", False),
         ("prediction_batch", run_prediction_batch_tests, "Batched prediction fan-out tests", False),
@@ -339,6 +370,7 @@ def main():
         ("minute_data", test_minute_data, "Minute data tests", False),
         ("minute_data_load", test_minute_data_load, "Minute data load tests", False),
         ("minute_data_import_export", test_minute_data_import_export, "Minute data import/export tests", False),
+        ("faq_recorder_config", test_faq_recorder_config, "FAQ recorder filter example matches the entities Predbat reads history for", False),
         ("minute_data_no_smoothing_backwards", test_minute_data_no_smoothing_backwards, "Minute data no-smoothing backwards tests", False),
         ("minute_data_no_smoothing_forward", test_minute_data_no_smoothing_forward, "Minute data no-smoothing forward tests", False),
         ("get_now_cumulative", test_get_now_from_cumulative, "Get now from cumulative tests", False),
@@ -392,8 +424,10 @@ def main():
         ("web_chart_currency", test_rates_chart_series_names_use_currency_symbol, "Rates chart series names follow currency_symbols tests", False),
         ("metrics_dashboard_soc_refresh", test_soc_chart_center_text_reads_live_data, "Metrics dashboard SoC chart live-refresh tests", False),
         ("web_functions", run_web_functions_tests, "Web function unit tests", False),
+        ("web_logo_image", run_web_logo_image_tests, "Local logo image route tests (issue #4562)", False),
         ("web_annual", test_web_annual, "Annual web tab prefill tests", False),
         ("web_annual_form", test_web_annual_form, "Annual web tab form tests", False),
+        ("web_annual_fast_mode", test_web_annual_fast_mode, "Annual web tab fast mode tests", False),
         ("web_annual_routes", test_web_annual_routes, "Annual web tab route tests", False),
         ("web_annual_results", test_web_annual_results, "Annual web tab results tests", False),
         ("web_annual_terminal_state", test_web_annual_terminal_state, "Annual web tab terminal-state claim/no-redirect-loop tests", False),
@@ -414,6 +448,7 @@ def main():
         ("octopus_slots", run_load_octopus_slots_tests, "Load Octopus slots tests", False),
         ("multi_car_iog", run_multi_car_iog_tests, "Multi-car IOG tests", False),
         ("rate_add_io_slots", run_rate_add_io_slots_tests, "Rate add IO slots tests", False),
+        ("iog_charge_skew", run_iog_charge_skew_tests, "IOG earlier-charge skew characterisation tests", False),
         ("rate_replicate", test_rate_replicate, "Rate replicate comprehensive tests (missing slots, IO, offsets, gas)", False),
         ("find_charge_window", test_find_charge_window, "Find charge window gap handling tests", False),
         ("find_charge_rate", test_find_charge_rate, "Find charge rate tests", False),
@@ -428,7 +463,11 @@ def main():
         ("saving_session_notify", test_saving_session_notify_config, "Saving session notification config tests", False),
         ("saving_session_default_rate", test_saving_session_default_rate, "Saving session default rate injection test", False),
         ("saving_session_axle_conflict", test_saving_session_axle_conflict, "Saving session Axle conflict avoidance test (issue #4120)", False),
+        ("saving_session_join_service_fallback", test_saving_session_join_service_fallback, "Saving session join service fallback test (issue #4548 point 3)", False),
+        ("trigger_callback_success_signal", test_trigger_callback_success_signal, "trigger_callback loopback success signal test (PR #4601 review)", False),
         ("saving_session_auto_join_toggle", test_saving_session_auto_join_toggle, "Saving session auto-join toggle test (issue #4120)", False),
+        ("saving_session_custom_entity_no_rewrite_match", test_saving_session_custom_entity_no_rewrite_match, "Saving session custom entity no rewrite match test (issue #4573)", False),
+        ("saving_session_entity_regex_power_rename", test_saving_session_entity_regex_power_rename, "Saving/free session entity regex Power Down/Up rename test (issue #4548 point 2)", False),
         ("alert_feed", test_alert_feed, "Alert feed tests", False),
         ("fox_api", run_fox_api_tests, "Fox API tests", False),
         ("deye_const", run_deye_const_tests, "DEYE constants tests", False),
@@ -438,6 +477,13 @@ def main():
         ("deye_control", run_deye_control_tests, "DEYE control-logic tests", False),
         ("deye_publish", run_deye_publish_tests, "DEYE publish/config tests", False),
         ("deye_storage", run_deye_storage_tests, "DEYE storage persistence tests", False),
+        ("sunsynk_const", run_sunsynk_const_tests, "Sunsynk constants tests", False),
+        ("sunsynk_auth", run_sunsynk_auth_tests, "Sunsynk auth tests", False),
+        ("sunsynk_api", run_sunsynk_api_tests, "Sunsynk API tests", False),
+        ("sunsynk_control", run_sunsynk_control_tests, "Sunsynk control-logic tests", False),
+        ("sunsynk_publish", run_sunsynk_publish_tests, "Sunsynk publish tests", False),
+        ("sunsynk_storage", run_sunsynk_storage_tests, "Sunsynk storage tests", False),
+        ("sunsynk_config", run_sunsynk_config_tests, "Sunsynk config/INVERTER_DEF tests", False),
         ("enphase_api", run_enphase_api_tests, "Enphase API tests", False),
         ("solcast", run_solcast_tests, "Solcast API tests", False),
         ("open_meteo", run_open_meteo_tests, "Open-Meteo solar forecast provider tests", False),
@@ -451,6 +497,7 @@ def main():
         ("sigenergy", run_sigenergy_tests, "Sigenergy Cloud API tests", False),
         ("iboost_smart", run_iboost_smart_tests, "iBoost smart tests", False),
         ("car_charging_smart", run_car_charging_smart_tests, "Car charging smart tests", False),
+        ("car_charging_scored", run_car_charging_scored_tests, "Car charging window scoring tests", False),
         ("car_charging_in_load_history", run_car_charging_in_load_history_tests, "Car charging in load history tests", False),
         ("car_plugged_state", run_car_plugged_state_tests, "Car plugged-in sensor state tests", False),
         ("car_charging_mode", run_car_charging_mode_tests, "Car charging mode decision tests", False),
@@ -551,6 +598,10 @@ def main():
         ("annual_scenarios", test_annual_scenarios, "Annual prediction scenario helper tests", False),
         ("annual_results", test_annual_results, "Annual prediction results assembly tests", False),
         ("annual_cli", test_annual_cli, "Annual prediction CLI output tests", False),
+        ("annual_cli_fast_flag", test_annual_cli_fast_flag, "Annual CLI --fast flag tests", False),
+        ("annual_interpolate", test_annual_interpolate, "Annual fast-mode interpolation curve tests", False),
+        ("annual_fast_mode_assembly", test_annual_fast_mode_assembly, "Annual fast-mode assembly tests", False),
+        ("annual_curve_reference", test_annual_curve_reference, "Annual fast-mode curve reference scoring", False),
         ("annual_cli_machine", test_annual_cli_machine, "Annual CLI machine mode tests", False),
         ("annual_cli_machine_end_to_end", test_annual_cli_machine_end_to_end, "Annual CLI machine mode end-to-end tests", False),
         ("annual_job", test_annual_job, "Annual subprocess job control tests", False),
