@@ -44,8 +44,11 @@
 // point of the check.
 // ABI 5: PkContext carries the car solar diversion fields, so a binary built before them has a
 // different context layout and must not be loaded against this Python.
-#define PK_ABI_VERSION 5
-#define PK_PARITY_REVISION 8
+// ABI 6: car_charging_in_load_history is gone from PkContext - planned car slots always add their load
+// when the car's energy is reported as load, as they did before it was introduced - so the layout
+// differs again and an ABI 5 binary must not be loaded against this Python.
+#define PK_ABI_VERSION 6
+#define PK_PARITY_REVISION 10
 #define PK_MAX_CARS 8
 #define PK_RUN_EVERY 5 // const.py RUN_EVERY
 
@@ -221,7 +224,6 @@ struct PkContext {
     int32_t inverter_can_charge_during_export;
     int32_t num_cars;
     int32_t car_energy_reported_load;
-    int32_t car_charging_in_load_history;
     int32_t car_charging_from_battery;
     int32_t car_charging_solar[PK_MAX_CARS];
     int32_t car_charging_plugged[PK_MAX_CARS];
@@ -696,6 +698,9 @@ static int32_t pk_run_one(const ContextStore *store, const PkScenario *s, PkResu
     double discharge_rate_now = c->discharge_rate_now;
     const bool car_enable = c->num_cars > 0;
     double car_soc[PK_MAX_CARS] = {0};
+    // Sun diverted into each car in the current step, so the planned grid top-up can be held to what the
+    // charger can still deliver on top of it - mirrors prediction.py car_solar_step
+    double car_solar_step[PK_MAX_CARS] = {0};
     for (int32_t car_n = 0; car_n < c->num_cars; car_n++) {
         car_soc[car_n] = c->car_charging_soc[car_n];
     }
@@ -825,6 +830,9 @@ static int32_t pk_run_one(const ContextStore *store, const PkScenario *s, PkResu
         double car_amount_premium = 0;
         double car_load_energy_bypass = 0;
         if (car_enable) {
+            for (int32_t car_n = 0; car_n < c->num_cars; car_n++) {
+                car_solar_step[car_n] = 0.0;
+            }
             // Opportunistic solar (sun-following) diversion model - prediction.py:691-728. Applied BEFORE any
             // planned grid charging so free solar is used first and a planned grid top-up only covers the remainder.
             for (int32_t car_n = 0; car_n < c->num_cars; car_n++) {
@@ -862,6 +870,7 @@ static int32_t pk_run_one(const ContextStore *store, const PkScenario *s, PkResu
                             if (car_solar_amount > 0) {
                                 pv_now -= car_solar_amount;
                                 car_soc[car_n] += car_solar_amount * c->car_charging_loss;
+                                car_solar_step[car_n] = car_solar_amount;
                             }
                         }
                     }
@@ -873,6 +882,11 @@ static int32_t pk_run_one(const ContextStore *store, const PkScenario *s, PkResu
                 const double car_load_now = c->car_load_flat[car_n * n_steps + k];
                 if (car_load_now > 0.0) {
                     double car_load_scale = car_load_now * step / 60.0;
+                    if (car_solar_step[car_n] > 0) {
+                        // One charger, one maximum: whatever mix of sun and grid it runs, it cannot deliver
+                        // more than car_charging_solar_max_power, so the top-up only gets what the sun left
+                        car_load_scale = std::min(car_load_scale, std::max(c->car_charging_solar_max_power[car_n] * step / 60.0 - car_solar_step[car_n], 0.0));
+                    }
                     car_load_scale = car_load_scale * c->car_charging_loss;
                     car_load_scale = std::max(std::min(car_load_scale, c->car_charging_limit[car_n] - car_soc[car_n]), 0.0);
                     car_soc[car_n] = car_soc[car_n] + car_load_scale;
@@ -883,10 +897,7 @@ static int32_t pk_run_one(const ContextStore *store, const PkScenario *s, PkResu
                     if (c->car_energy_reported_load) {
                         // Note: mirrors the Python engine exactly - the cumulative premium amount is added per car
                         car_amount_premium += car_load_scale / c->car_charging_loss;
-                        // Already present in the historical load means adding the planned slot would double count
-                        if (!c->car_charging_in_load_history) {
-                            load_yesterday += car_amount_premium;
-                        }
+                        load_yesterday += car_amount_premium;
                     } else {
                         car_load_energy_bypass += car_load_scale / c->car_charging_loss;
                     }

@@ -91,7 +91,6 @@ class Prediction(PredictionBatch):
             self.car_charging_soc_next = base.car_charging_soc_next
             self.car_charging_loss = base.car_charging_loss
             self.car_energy_reported_load = base.car_energy_reported_load
-            self.car_charging_in_load_history = base.car_charging_in_load_history
             self.reserve = base.reserve
             self.metric_standing_charge = base.metric_standing_charge
             self.set_charge_freeze = base.set_charge_freeze
@@ -598,6 +597,9 @@ class Prediction(PredictionBatch):
         record_time = {}
         car_soc = self.car_charging_soc[:]
         final_car_soc = car_soc[:]
+        # Sun diverted into each car in the current step, so the planned grid top-up can be held to what the
+        # charger can still deliver on top of it - allocated once, zeroed per step, this is the hot loop
+        car_solar_step = [0.0] * self.num_cars
         charge_rate_now = self.charge_rate_now
         discharge_rate_now = self.discharge_rate_now
         battery_state = "-"
@@ -814,6 +816,8 @@ class Prediction(PredictionBatch):
 
             # Simulate car charging
             if car_enable:
+                for car_n in range(self.num_cars):
+                    car_solar_step[car_n] = 0.0
                 # Opportunistic solar (sun-following) diversion model - applied BEFORE any planned grid charging so
                 # that free solar is used first and a planned grid top-up only covers the remainder (mirrors EVCC).
                 # The car takes the PV left after the house load is served (true surplus), once the home battery is
@@ -859,6 +863,7 @@ class Prediction(PredictionBatch):
                                     pv_now -= car_solar_amount
                                     car_soc[car_n] += car_solar_amount * self.car_charging_loss
                                     car_solar_today += car_solar_amount
+                                    car_solar_step[car_n] = car_solar_amount
 
                 # Planned (grid) car charging - tops up toward the plan target (car_charging_limit), after solar
                 car_load, car_rate_slot = in_car_slot(minute_absolute, self.num_cars, self.car_charging_slots)
@@ -867,6 +872,10 @@ class Prediction(PredictionBatch):
                 for car_n in range(self.num_cars):
                     if car_load[car_n] > 0.0:
                         car_load_scale = car_load[car_n] * step / 60.0
+                        if car_solar_step[car_n] > 0:
+                            # One charger, one maximum: whatever mix of sun and grid it runs, it cannot deliver
+                            # more than car_charging_solar_max_power, so the top-up only gets what the sun left
+                            car_load_scale = min(car_load_scale, max(self.car_charging_solar_max_power[car_n] * step / 60.0 - car_solar_step[car_n], 0))
                         car_load_scale = car_load_scale * self.car_charging_loss
                         car_load_scale = max(min(car_load_scale, self.car_charging_limit[car_n] - car_soc[car_n]), 0)
                         car_soc[car_n] = car_soc[car_n] + car_load_scale
@@ -879,10 +888,7 @@ class Prediction(PredictionBatch):
                             # car_amount_premium must accumulate either way - it is consumed by the IOG beyond-cap
                             # premium below, and the grid import still contains the car when it comes from history.
                             car_amount_premium += car_load_scale / self.car_charging_loss
-                            # When the car energy is already present in the historical load, adding the planned
-                            # slot on top of it would double count the same kWh, so only add it when it is not.
-                            if not self.car_charging_in_load_history:
-                                load_yesterday += car_amount_premium
+                            load_yesterday += car_amount_premium
                         else:
                             car_load_energy_bypass += car_load_scale / self.car_charging_loss
 

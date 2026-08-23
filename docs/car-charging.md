@@ -482,31 +482,6 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
   `evcc_automatic` on it is taken from evcc's own `prioritySoc` instead, which means the same thing, so the two cannot drift apart. Even then it is only written when
   the value in evcc changes, so adjusting it in Home Assistant is not undone on the next poll.
 
-### Charging the car from the home battery
-
-**switch.predbat_car_charging_from_battery** (default Off) lets the home battery serve the car. With it on, what a
-charging window costs is no longer its import rate - the energy comes out of the battery, and its price is whatever the
-plan gives up by not having it there. That turns on several things at once: which export the energy would otherwise have
-been sold into, whether the battery is already at its discharge limit in that window, the round-trip losses, and the
-cycle cost.
-
-Rather than approximate that with a rate rule, Predbat prices each candidate window by running the forecast with the
-car's load in it and taking the difference. The cheapest window is taken, the rest are priced again so the next choice
-sees the charge the first one has already spent, and so on until the car reaches its target. There is nothing to
-configure: it follows from the prices, and it is only used when **car_charging_from_battery** is on, smart charging is
-on, and the car's energy is reported as load rather than already being part of the load history.
-
-Two consequences worth knowing:
-
-- The car may start charging as soon as it is plugged in, even with smart charging on, when the battery is the cheapest
-  source at that moment.
-- It will equally wait through a well paid export window and charge afterwards, because a kWh taken while the battery is
-  selling at its limit is a kWh that never gets sold at that price.
-
-Each planned slot on **binary_sensor.predbat_car_charging_slot** carries a `source` of `battery` or `grid` and an
-`effective` price alongside the window's `average` import rate, so you can see which it chose and what it expects to pay.
-The `Car ... scored charging windows` line in the log shows the same, along with how long the scoring took.
-
 ### Setting it up by hand
 
 A worked example for a 3-phase 6-16A charger that diverts surplus on its own, charging one car to 80% from the sun while a plan still guarantees the departure target:
