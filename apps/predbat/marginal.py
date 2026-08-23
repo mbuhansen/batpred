@@ -35,6 +35,47 @@ class Marginal:
     to a Home Assistant sensor.
     """
 
+    def score_extra_load(self, extra_load, kernel_static_cache=None, include_battery_value=False):
+        """Return the metric of the current best plan with extra_load added to the load forecast.
+
+        extra_load is {relative_minute: kWh_in_that_PREDICT_STEP}, matching load_minutes_step; minutes
+        outside the forecast are ignored. Take the difference against a run with no extra load to get
+        what that load costs, including everything a rate comparison cannot see at once - which export
+        it displaces, whether the battery is at its discharge limit there, losses and cycle cost.
+
+        include_battery_value credits the charge still in the battery at the end of the plan, the way
+        metric_blend does for the planner's own metric. run_prediction does not, so without it a load
+        the battery absorbs looks free whenever the horizon ends with charge to spare - exactly the
+        question a caller comparing battery against grid is asking. Off by default so
+        calculate_marginal_costs keeps publishing the numbers it always has.
+
+        kernel_static_cache is passed straight through to the Prediction. Every context built with the
+        same cache must differ ONLY in its load, which is all this varies - see create_kernel_context.
+        """
+        # Shallow copy is a full copy: load_minutes_step is a flat minute -> kWh dict
+        modified_load = dict(self.load_minutes_step)
+        for minute, amount in extra_load.items():
+            if minute in modified_load:
+                modified_load[minute] += amount
+
+        # No need to include 10% extra load as we only run normal simulations.
+        pred = Prediction(self, self.pv_forecast_minute_step, self.pv_forecast_minute_step, modified_load, modified_load, kernel_static_cache=kernel_static_cache)
+        (new_metric, _import_battery, _import_house, _export, _soc_min, final_soc, _soc_min_minute, _cycle, _metric_keep, final_iboost, *_) = pred.run_prediction(
+            self.charge_limit_best,
+            self.charge_window_best,
+            self.export_window_best,
+            self.export_limits_best,
+            False,
+            self.end_record,
+        )
+
+        if include_battery_value:
+            # The same balancing payment metric_blend applies, for the nominal scenario run here
+            value_rate = self.battery_value_rate(self.minutes_now + self.end_record)
+            new_metric -= (final_soc * self.metric_battery_value_scaling + final_iboost * self.iboost_value_scaling) * value_rate
+
+        return new_metric
+
     def calculate_marginal_costs(self):
         """Calculate the marginal energy cost matrix.
 
@@ -82,28 +123,9 @@ class Marginal:
             for idx, offset in enumerate(MARGINAL_TIME_OFFSETS):
                 time_label = time_labels[idx]
 
-                # Copy the load forecast to avoid mutating shared data - it is a flat minute -> kWh
-                # dict, so a shallow copy is a full copy and deepcopy only walked it more slowly
-                modified_load = dict(self.load_minutes_step)
-
                 # Inject extra load into the 1-hour window starting at `offset` minutes from now
-                for minute in range(offset, offset + 60, PREDICT_STEP):
-                    if minute in modified_load:
-                        modified_load[minute] += extra_per_step
-
-                # Create a fresh Prediction with the modified load.
-                # No need to include 10% extra load as we only run normal simulations.
-                pred = Prediction(self, self.pv_forecast_minute_step, self.pv_forecast_minute_step, modified_load, modified_load, kernel_static_cache=kernel_static_cache)
-
-                # Run prediction against the current best charge/discharge plan, no save to HA
-                (new_metric, *_) = pred.run_prediction(
-                    self.charge_limit_best,
-                    self.charge_window_best,
-                    self.export_window_best,
-                    self.export_limits_best,
-                    False,
-                    self.end_record,
-                )
+                extra_load = {minute: extra_per_step for minute in range(offset, offset + 60, PREDICT_STEP)}
+                new_metric = self.score_extra_load(extra_load, kernel_static_cache=kernel_static_cache)
 
                 # Marginal cost in currency units per kWh = delta metric / extra kWh
                 marginal_cost = dp2((new_metric - baseline_metric) / extra_kwh)

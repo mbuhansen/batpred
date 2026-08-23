@@ -82,6 +82,9 @@ CAR_UNPLUGGED_RESPONSE = ["off", "false", "no", "0", "disconnected", "unavailabl
 CAR_MODE_NOW = "now"
 CAR_MODE_SOLAR = "solar"
 CAR_MODE_OFF = "off"
+# Ceiling on how many candidate windows log_car_window_scoring prices per car per cycle. Each is a full
+# forecast run, so an unbounded ready time on a big car would otherwise spend seconds in a diagnostic.
+CAR_SCORE_MAX_WINDOWS = 24
 # Sentinel values for an export window's target SoC/limit (export_limits_best and friends).
 # A real target is any value below EXPORT_LIMIT_FREEZE, expressed as a percentage 0-100
 # (see calc_percent_limit) with the fractional part sometimes encoding a low-power export rate.
