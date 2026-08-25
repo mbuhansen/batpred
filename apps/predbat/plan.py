@@ -20,7 +20,7 @@ call to the C++ prediction kernel, which is where the threading now lives.
 
 from datetime import datetime, timedelta
 from multiprocessing import cpu_count
-from const import PREDICT_STEP, PV_SCENARIO_NOMINAL, PV_SCENARIO_PV10, PV_SCENARIO_PV90, TIME_FORMAT, MINUTE_WATT, EXPORT_LIMIT_FREEZE, EXPORT_LIMIT_IDLE
+from const import CAR_SCORE_MAX_WINDOWS, PREDICT_STEP, PV_SCENARIO_NOMINAL, PV_SCENARIO_PV10, PV_SCENARIO_PV90, TIME_FORMAT, MINUTE_WATT, EXPORT_LIMIT_FREEZE, EXPORT_LIMIT_IDLE
 
 from utils import calc_percent_limit, clone_windows, dp0, dp1, dp2, dp3, dp4, remove_intersecting_windows, in_car_slot
 from prediction import Prediction
@@ -1662,6 +1662,10 @@ class Plan:
 
                 # Compute marginal energy cost matrix (what-if extra load scenarios)
                 self.calculate_marginal_costs()
+
+                # Measure whether pricing the car's windows against the forecast would choose differently
+                # than the import-rate sort did - diagnostic only, the plan is not changed
+                self.log_car_window_scoring()
 
                 # HTML data
                 text = self.short_textual_plan(soc_min, soc_min_minute, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
@@ -5133,6 +5137,110 @@ class Plan:
         # Return sorted back in time order
         plan = self.sort_window_by_time(plan)
         return plan
+
+    def car_window_load_delta(self, car_n, window, ready_minutes):
+        """Return the load forecast delta a car charging in this window would add, or None.
+
+        Keys are minutes relative to now on the PREDICT_STEP grid, matching load_minutes_step; the value
+        is the grid-side draw in that step. Mirrors what plan_car_charging would book for the window -
+        the charging rate over its length, clipped to the ready time and to what the car still needs.
+        """
+        start = max(window["start"], self.minutes_now)
+        end = min(window["end"], ready_minutes)
+        if end <= start:
+            return None
+
+        needed = max(self.car_charging_limit[car_n] - self.car_charging_soc[car_n], 0)
+        if needed <= 0:
+            return None
+
+        kwh = self.car_charging_rate[car_n] * (end - start) / 60.0
+        if self.car_charging_loss > 0:
+            kwh = min(kwh, needed / self.car_charging_loss)
+        if kwh <= 0:
+            return None
+
+        extra = {}
+        kwh_per_minute = kwh / (end - start)
+        start_rel = start - self.minutes_now
+        end_rel = end - self.minutes_now
+        first = (start_rel // PREDICT_STEP) * PREDICT_STEP
+        for minute in range(first, end_rel, PREDICT_STEP):
+            covered = min(minute + PREDICT_STEP, end_rel) - max(minute, start_rel)
+            if covered > 0:
+                extra[minute] = extra.get(minute, 0.0) + kwh_per_minute * covered
+        return extra, kwh
+
+    def log_car_window_scoring(self):
+        """Log what pricing the car's windows against the forecast would choose, without changing the plan.
+
+        plan_car_charging orders candidate windows by import rate. With car_charging_from_battery the home
+        battery serves the car, so that rate is not what the charge costs there - what it costs is what the
+        plan gives up by having the energy leave the battery then. This measures the difference and logs it.
+        It deliberately does NOT touch car_charging_slots: the point is to find out whether the two ever
+        disagree by enough to be worth acting on, before anything acts on it.
+
+        Called from calculate_plan after calculate_marginal_costs, which is the only place the live
+        load_minutes_step and pv_forecast_minute_step exist - fetch runs before they are built and they are
+        freed again at the end of every cycle.
+        """
+        if not self.car_charging_from_battery or not self.num_cars:
+            return
+        if not self.charge_limit_best or not self.load_minutes_step or not getattr(self, "end_record", 0):
+            return
+
+        for car_n in range(self.num_cars):
+            slots = self.car_charging_slots[car_n]
+            if not slots:
+                continue
+
+            ready_minutes = self.car_ready_minutes(car_n)
+            candidates = [window for window in self.low_rates if window["end"] > self.minutes_now and window["start"] < ready_minutes]
+            if not candidates:
+                continue
+            candidates = candidates[:CAR_SCORE_MAX_WINDOWS]
+
+            time_start = time.time()
+            # Every context differs only in its load, so the load-independent arrays are built once
+            kernel_static_cache = {}
+            baseline = self.score_extra_load({}, kernel_static_cache=kernel_static_cache, include_battery_value=True)
+            predictions = 1
+
+            best = None
+            for window in candidates:
+                delta = self.car_window_load_delta(car_n, window, ready_minutes)
+                if not delta:
+                    continue
+                extra, kwh = delta
+                metric = self.score_extra_load(extra, kernel_static_cache=kernel_static_cache, include_battery_value=True)
+                predictions += 1
+                cost = (metric - baseline) / kwh
+                if (best is None) or (cost < best[0]):
+                    best = (cost, window, kwh)
+
+            if best is None:
+                continue
+
+            cost, window, kwh = best
+            picked = slots[0]
+            source = "battery" if cost < window["average"] else "grid"
+            self.log(
+                "Car {} window scoring (diagnostic): price sort {} @{}{}, scoring {} @{}{} ({}), delta {}{}/kWh over {}kWh, {} prediction(s) in {}s".format(
+                    car_n,
+                    self.time_abs_str(picked["start"]),
+                    dp2(picked["average"]),
+                    self.currency_symbols[1],
+                    self.time_abs_str(window["start"]),
+                    dp2(cost),
+                    self.currency_symbols[1],
+                    source,
+                    dp2(cost - picked["average"]),
+                    self.currency_symbols[1],
+                    dp2(kwh),
+                    predictions,
+                    dp2(time.time() - time_start),
+                )
+            )
 
     def car_ready_minutes(self, car_n):
         """
