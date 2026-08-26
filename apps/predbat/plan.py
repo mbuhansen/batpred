@@ -5171,6 +5171,30 @@ class Plan:
                 extra[minute] = extra.get(minute, 0.0) + kwh_per_minute * covered
         return extra, kwh
 
+    def car_slot_load_delta(self, slot):
+        """Return the load forecast delta an already planned slot adds, keyed for score_extra_load.
+
+        Unlike car_window_load_delta this takes the energy the slot has already booked rather than working
+        it out from the charging rate, so the planned slot and a candidate window are scored on the same
+        terms - what each actually puts into the car.
+        """
+        length = slot["end"] - slot["start"]
+        if length <= 0 or slot["kwh"] <= 0:
+            return None
+
+        extra = {}
+        kwh_per_minute = slot["kwh"] / length
+        start_rel = slot["start"] - self.minutes_now
+        end_rel = slot["end"] - self.minutes_now
+        first = (start_rel // PREDICT_STEP) * PREDICT_STEP
+        for minute in range(first, end_rel, PREDICT_STEP):
+            covered = min(minute + PREDICT_STEP, end_rel) - max(minute, start_rel)
+            if covered > 0:
+                extra[minute] = extra.get(minute, 0.0) + kwh_per_minute * covered
+        if not extra:
+            return None
+        return extra, slot["kwh"]
+
     def log_car_window_scoring(self):
         """Log what pricing the car's windows against the forecast would choose, without changing the plan.
 
@@ -5186,7 +5210,9 @@ class Plan:
         """
         if not self.car_charging_from_battery or not self.num_cars:
             return
-        if not self.charge_limit_best or not self.load_minutes_step or not getattr(self, "end_record", 0):
+        # charge_limit_best may legitimately be empty - a plan with no charge windows is still a plan.
+        # What scoring cannot do without is the live forecast, which only exists inside calculate_plan.
+        if not self.load_minutes_step or not getattr(self, "end_record", 0):
             return
 
         for car_n in range(self.num_cars):
@@ -5222,19 +5248,32 @@ class Plan:
                 continue
 
             cost, window, kwh = best
+
+            # Score the plan's own pick on the same terms. Comparing a scored price against the window's
+            # import rate would only restate that battery energy is cheaper than importing, which is true
+            # wherever the charge is put and says nothing about the placement this is trying to measure.
             picked = slots[0]
-            source = "battery" if cost < window["average"] else "grid"
+            picked_delta = self.car_slot_load_delta(picked)
+            if not picked_delta:
+                continue
+            picked_extra, picked_kwh = picked_delta
+            picked_cost = (self.score_extra_load(picked_extra, kernel_static_cache=kernel_static_cache, include_battery_value=True) - baseline) / picked_kwh
+            predictions += 1
+
             self.log(
-                "Car {} window scoring (diagnostic): price sort {} @{}{}, scoring {} @{}{} ({}), delta {}{}/kWh over {}kWh, {} prediction(s) in {}s".format(
+                "Car {} window scoring (diagnostic): price sort {} @{}{} scored {}{}, best {} @{}{} scored {}{}, delta {}{}/kWh over {}kWh, {} prediction(s) in {}s".format(
                     car_n,
                     self.time_abs_str(picked["start"]),
                     dp2(picked["average"]),
                     self.currency_symbols[1],
+                    dp2(picked_cost),
+                    self.currency_symbols[1],
                     self.time_abs_str(window["start"]),
+                    dp2(window["average"]),
+                    self.currency_symbols[1],
                     dp2(cost),
                     self.currency_symbols[1],
-                    source,
-                    dp2(cost - picked["average"]),
+                    dp2(cost - picked_cost),
                     self.currency_symbols[1],
                     dp2(kwh),
                     predictions,
