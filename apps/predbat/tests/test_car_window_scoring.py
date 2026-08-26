@@ -44,8 +44,11 @@ def setup_scoring(my_predbat, import_rate=150.0, export_rate=5.0, forecast_hours
     my_predbat.rate_import_base = my_predbat.rate_import.copy()
     my_predbat.rate_export_base = my_predbat.rate_export.copy()
 
+    # Keep the plan's own charge window clear of the candidate windows below - a charge window with a
+    # zero target over the first half hour makes that one window import, which is a property of the
+    # scenario rather than of the placement being measured
     my_predbat.charge_limit_best = [0.0]
-    my_predbat.charge_window_best = [{"start": my_predbat.minutes_now, "end": my_predbat.minutes_now + 30, "average": import_rate}]
+    my_predbat.charge_window_best = [{"start": my_predbat.minutes_now + 20 * 60, "end": my_predbat.minutes_now + 20 * 60 + 30, "average": import_rate}]
     my_predbat.export_window_best = []
     my_predbat.export_limits_best = []
 
@@ -104,27 +107,107 @@ def run_diagnostic_is_read_only(my_predbat):
     return failed
 
 
+def capture_scoring(my_predbat):
+    """Run the diagnostic with self.log captured, returning the scoring lines it emitted.
+
+    my_predbat has no log buffer of its own, so wrap the method. An earlier version of this test read a
+    log_messages attribute that does not exist, which made every assertion in it vacuous.
+    """
+    captured = []
+    original = my_predbat.log
+
+    def collect(message):
+        """Record the message, then let the real logger have it."""
+        captured.append(str(message))
+        return original(message)
+
+    my_predbat.log = collect
+    try:
+        my_predbat.log_car_window_scoring()
+    finally:
+        my_predbat.log = original
+    return [line for line in captured if "window scoring" in line]
+
+
 def run_diagnostic_gates(my_predbat):
     """It only runs where it can say something the import rate cannot."""
     failed = False
     print("**** Running Test: window scoring gates ****")
 
     setup_scoring(my_predbat)
-    logged_before = len(my_predbat.log_messages) if hasattr(my_predbat, "log_messages") else None
+
+    if not capture_scoring(my_predbat):
+        print("ERROR: the diagnostic logged nothing when it should have run")
+        failed = True
 
     my_predbat.car_charging_from_battery = False
-    my_predbat.log_car_window_scoring()
+    if capture_scoring(my_predbat):
+        print("ERROR: the diagnostic ran with car_charging_from_battery off")
+        failed = True
     my_predbat.car_charging_from_battery = True
 
-    # With no previous plan there is nothing to score against
+    # An empty charge plan is still a plan and must not stop it
     saved_limit = my_predbat.charge_limit_best
     my_predbat.charge_limit_best = []
-    my_predbat.log_car_window_scoring()
+    if not capture_scoring(my_predbat):
+        print("ERROR: an empty charge plan should not stop the diagnostic")
+        failed = True
     my_predbat.charge_limit_best = saved_limit
 
-    # Neither of those may have logged a scoring line
-    if logged_before is not None and any("window scoring" in str(line) for line in my_predbat.log_messages[logged_before:]):
-        print("ERROR: the diagnostic ran while gated off")
+    # Without the live forecast there is nothing to score against
+    saved_load = my_predbat.load_minutes_step
+    my_predbat.load_minutes_step = {}
+    if capture_scoring(my_predbat):
+        print("ERROR: the diagnostic ran without the live load forecast")
+        failed = True
+    my_predbat.load_minutes_step = saved_load
+
+    return failed
+
+
+def run_diagnostic_like_for_like(my_predbat):
+    """On flat rates no window is genuinely better, so the reported delta must be about zero.
+
+    Guards the comparison itself: scoring the best window against the plan's pick priced at its raw import
+    rate produced a steady ~100 ore/kWh "saving" that was only restating that battery energy is cheaper
+    than importing - true wherever the charge is put, and nothing to do with the placement.
+    """
+    failed = False
+    print("**** Running Test: window scoring compares like for like ****")
+
+    ready = setup_scoring(my_predbat)
+    now = my_predbat.minutes_now
+
+    # Two windows an hour apart, both clear of the first hour. Load placed close to now is partly met by
+    # import, which is a real property of the model rather than of the placement, so comparing across that
+    # boundary would measure the wrong thing.
+    cache = {}
+    baseline = my_predbat.score_extra_load({}, kernel_static_cache=cache, include_battery_value=True)
+    scores = []
+    for offset in (120, 180):
+        extra, kwh = my_predbat.car_window_load_delta(0, {"start": now + offset, "end": now + offset + 60, "average": 150.0}, ready)
+        scores.append((my_predbat.score_extra_load(extra, kernel_static_cache=cache, include_battery_value=True) - baseline) / kwh)
+
+    if abs(scores[0] - scores[1]) > 0.01:
+        print("ERROR: on flat rates two later windows should score the same, got {} and {}".format(scores[0], scores[1]))
+        failed = True
+
+    # And the logged delta must be between two scored prices, not a scored price against an import rate
+    lines = capture_scoring(my_predbat)
+    if not lines:
+        print("ERROR: the diagnostic logged nothing")
+        return True
+    line = lines[-1]
+    currency = my_predbat.currency_symbols[1]
+    parts = line.split("scored ")
+    if len(parts) != 3:
+        print("ERROR: expected both sides of the comparison to be scored, got: {}".format(line))
+        return True
+    picked_score = float(parts[1].split(currency)[0])
+    best_score = float(parts[2].split(currency)[0])
+    delta = float(line.split("delta ")[1].split(currency)[0])
+    if abs(delta - (best_score - picked_score)) > 0.02:
+        print("ERROR: delta {} is not the difference of the two scored prices ({} - {}) in: {}".format(delta, best_score, picked_score, line))
         failed = True
 
     return failed
@@ -218,6 +301,7 @@ def run_car_window_scoring_tests(my_predbat):
     try:
         failed |= run_diagnostic_is_read_only(my_predbat)
         failed |= run_diagnostic_gates(my_predbat)
+        failed |= run_diagnostic_like_for_like(my_predbat)
         failed |= run_diagnostic_load_delta(my_predbat)
         failed |= run_diagnostic_finds_cheaper(my_predbat)
     finally:
