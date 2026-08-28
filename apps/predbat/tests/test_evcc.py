@@ -437,27 +437,30 @@ def test_desired_mode_and_gates():
     check("no_plan_yet", api.desired_mode(0), (None, "no_plan_yet"), failures)
 
     set_mode("solar", "idle")
-    check("allowed", api.should_write(0, EVCC_MODE_OFF, "idle"), (True, "idle"), failures)
-    check("mode_none", api.should_write(0, None, "no_plan_yet")[1], "no_plan_yet", failures)
+    check("allowed", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (True, "export_better"), failures)
+    check("mode_none", api.should_write(0, None, "no_plan_yet", True)[1], "no_plan_yet", failures)
+    # An empty loadpoint, and a decision Predbat has not made, are both left to evcc
+    check("not_connected", api.should_write(0, EVCC_MODE_PV, "idle", False), (False, "not_connected"), failures)
+    check("no_decision", api.should_write(0, EVCC_MODE_PV, "idle", True), (False, "no_decision"), failures)
 
     api.control = False
-    check("control_disabled", api.should_write(0, EVCC_MODE_OFF, "idle"), (False, "control_disabled"), failures)
+    check("control_disabled", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "control_disabled"), failures)
     api.control = True
 
     api.control_enabled[0] = False
-    check("switch_off", api.should_write(0, EVCC_MODE_OFF, "idle"), (False, "switch_off"), failures)
+    check("switch_off", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "switch_off"), failures)
     api.control_enabled[0] = True
 
     api.args["set_read_only"] = True
-    check("read_only", api.should_write(0, EVCC_MODE_OFF, "idle"), (False, "read_only"), failures)
+    check("read_only", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "read_only"), failures)
     api.args["set_read_only"] = False
 
     api.plan_valid = False
-    check("plan_invalid", api.should_write(0, EVCC_MODE_OFF, "idle"), (False, "plan_invalid"), failures)
+    check("plan_invalid", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "plan_invalid"), failures)
     api.plan_valid = True
 
     api.state_time = api.now_utc - timedelta(hours=1)
-    check("state_stale", api.should_write(0, EVCC_MODE_OFF, "idle"), (False, "state_stale"), failures)
+    check("state_stale", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "state_stale"), failures)
     return failures
 
 
@@ -492,7 +495,9 @@ def test_apply_modes_writes():
     print("**** Running Test: evcc_apply_modes ****")
     failures = []
     api = MockEvccAPI(host="http://evcc", control=True, mode_refresh_minutes=15)
-    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="off")]}
+    # Connected throughout: an empty loadpoint is evcc's own business and is never written to,
+    # which test_no_write_without_a_decision covers
+    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="off", connected=True)]}
     api.state_time = api.now_utc
     api.loadpoint_map = {0: 0}
     api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
@@ -526,10 +531,95 @@ def test_apply_modes_writes():
     check("override_no_write", len(writes), 2, failures)
     check("override_sensor", api.entities["binary_sensor.predbat_evcc_override"]["state"], "on", failures)
 
-    # Plugging a car in is a new intent, so control resumes
+    # Unplugging and plugging a car back in is a new intent, so control resumes
+    api.state["loadpoints"][0]["connected"] = False
+    run_async(api.apply_modes())
+    check("unplugged_no_write", len(writes), 2, failures)
     api.state["loadpoints"][0]["connected"] = True
     run_async(api.apply_modes())
     check("resumed_on_connect", len(writes), 3, failures)
+    return failures
+
+
+def test_no_write_without_a_decision():
+    """An empty loadpoint, and a car with nothing planned, are left to evcc's own defaults"""
+    print("**** Running Test: evcc_no_write ****")
+    failures = []
+
+    def build(mode_state, reason, connected, observed="off"):
+        """Drive apply_modes once for one Predbat decision, returning (component, writes)."""
+        api = MockEvccAPI(host="http://evcc", control=True, mode_refresh_minutes=15)
+        api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=observed, connected=connected)], "vehicles": SAMPLE_STATE["vehicles"]}
+        api.state_time = api.now_utc
+        api.loadpoint_map = {0: 0}
+        api.entities["sensor.predbat_car_charging_mode"] = {"state": mode_state, "attributes": {"reason": reason}}
+        writes = []
+
+        async def fake_set_mode(loadpoint_id, mode):
+            """Record the write instead of performing it."""
+            writes.append((loadpoint_id, mode))
+            return True
+
+        api.client.set_mode = fake_set_mode
+        run_async(api.apply_modes())
+        return api, writes
+
+    # No car on the loadpoint: evcc's own reset-on-disconnect mode stands, whatever Predbat rests at
+    api, writes = build("solar", "idle", connected=False)
+    check("empty_no_write", writes, [], failures)
+    target = api.entities["sensor.predbat_evcc_target_mode"]
+    check("empty_reason", target["attributes"]["reason"], "not_connected", failures)
+    check("empty_not_allowed", target["attributes"]["allowed"], False, failures)
+    # The mode Predbat would have wanted is still shown, so the sensor stays readable
+    check("empty_target", target["state"], EVCC_MODE_PV, failures)
+
+    # Connected but nothing decided - idle is an absence, not a decision to follow the sun
+    _, writes = build("solar", "idle", connected=True)
+    check("idle_no_write", writes, [], failures)
+    api, _ = build("solar", "idle", connected=True)
+    check("idle_reason", api.entities["sensor.predbat_evcc_target_mode"]["attributes"]["reason"], "no_decision", failures)
+
+    # Every real decision is still written
+    for state, reason, expected in (("now", "grid_slot", EVCC_MODE_NOW), ("solar", "solar", EVCC_MODE_PV), ("off", "export_better", EVCC_MODE_OFF), ("off", "home_battery_low", EVCC_MODE_OFF)):
+        _, writes = build(state, reason, connected=True)
+        check("writes_{}".format(reason), writes, [(1, expected)], failures)
+
+    # evcc resetting the mode itself on disconnect must not read as somebody overruling Predbat
+    api = MockEvccAPI(host="http://evcc", control=True, override_minutes=60)
+    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="now", connected=True)]}
+    api.state_time = api.now_utc
+    api.loadpoint_map = {0: 0}
+    api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
+    writes = []
+
+    async def fake_set_mode(loadpoint_id, mode):
+        """Record the write instead of performing it."""
+        writes.append((loadpoint_id, mode))
+        return True
+
+    api.client.set_mode = fake_set_mode
+    run_async(api.apply_modes())
+    check("session_wrote", writes, [(1, EVCC_MODE_NOW)], failures)
+
+    # Unplug: evcc puts the loadpoint back to its own default
+    api.state["loadpoints"][0].update(connected=False, mode="off")
+    run_async(api.apply_modes())
+    check("reset_no_override", api.entities["binary_sensor.predbat_evcc_override"]["state"], "off", failures)
+    check("reset_no_write", len(writes), 1, failures)
+
+    # A new session writes again straight away, even though the wanted mode has not changed
+    api.state["loadpoints"][0].update(connected=True)
+    run_async(api.apply_modes())
+    check("new_session_writes", len(writes), 2, failures)
+
+    # The vehicle's own default mode is published, so a mode Predbat never wrote is not blamed on it
+    api = MockEvccAPI(host="http://evcc")
+    state = copy.deepcopy(SAMPLE_STATE)
+    state["vehicles"]["db:3"]["mode"] = "pv"
+    api.state = state
+    api.loadpoint_map = {0: 0}
+    api.publish_car(0, state["loadpoints"][0])
+    check("vehicle_default", api.entities["sensor.predbat_evcc_mode"]["attributes"]["vehicle_default_mode"], "pv", failures)
     return failures
 
 
@@ -824,6 +914,7 @@ def test_evcc(my_predbat=None):
         test_priority_soc,
         test_override_detection,
         test_apply_modes_writes,
+        test_no_write_without_a_decision,
         test_client_http,
         test_registry_and_schema,
         test_run_cycle,
