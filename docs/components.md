@@ -578,7 +578,7 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | `sensor.predbat_evcc_limit_soc` | The loadpoint's effective SoC limit - its session limit, else the vehicle's standing one - used as the solar charging cap |
 | `sensor.predbat_evcc_max_power` / `_min_power` / `_power_step` | Charger power band in kW, derived from amps and phases |
 | `sensor.predbat_evcc_charge_power` | Present charging power in W |
-| `sensor.predbat_evcc_mode` | evcc's current charging mode |
+| `sensor.predbat_evcc_mode` | evcc's current charging mode, with the vehicle's own default in `vehicle_default_mode` |
 | `sensor.predbat_evcc_target_mode` | The mode Predbat wants, with a `reason` explaining why it was or was not written |
 | `binary_sensor.predbat_evcc_override` | On when somebody changed the mode in evcc and Predbat has backed off |
 | `switch.predbat_evcc_control` | Runtime kill switch for mode writing (only when `evcc_control` is set) |
@@ -592,15 +592,24 @@ With `evcc_control: True`, Predbat maps its own decision onto evcc's modes:
 | Predbat state | evcc mode |
 | ------------- | --------- |
 | `now` - a grid slot is planned | `now` |
-| `solar` - take the surplus, or nothing is planned | `pv` (or `minpv` with `evcc_use_minpv`) |
+| `solar` - take the surplus | `pv` (or `minpv` with `evcc_use_minpv`) |
 | `off` - the export pays better, or this car does no solar charging | `off` |
 
 The decision is not made here: it is Predbat's own `sensor.predbat_car_charging_mode`, described under
 [the charging mode](car-charging.md#the-charging-mode), so evcc and a plain Home Assistant automation
-driving some other charger act on identical logic. Note that `solar` is the resting state - evcc is left
-in `pv` rather than `off` when nothing is planned, so the car still charges from the sun if Predbat stops
-publishing. The loadpoint's own departure plan survives either mode: `off` stops evcc acting on the plan
-itself, but the plan is kept, stays editable, and is still reported to Predbat.
+driving some other charger act on identical logic. The loadpoint's own departure plan survives either
+mode: `off` stops evcc acting on the plan itself, but the plan is kept, stays editable, and is still
+reported to Predbat.
+
+**Predbat only writes a mode when it has one to give.** Nothing is written while the loadpoint has no car
+on it, and nothing is written when Predbat's decision is its resting `idle` - both are left to evcc's own
+settings, which already cover them: the loadpoint's `mode` is what evcc resets to when the car is
+unplugged, and the vehicle's `mode` is what evcc applies when it is plugged back in. So a loadpoint you
+set to `off` between sessions stays `off`, and `sensor.predbat_evcc_target_mode` says `not_connected` or
+`no_decision` in its `reason` rather than writing over you. `sensor.predbat_evcc_mode` reports the
+vehicle's own default in `vehicle_default_mode`, so a mode change at plug-in is not mistaken for Predbat's
+doing. Note that evcc's configured defaults are not readable over the API without an `evcc_api_key` -
+Predbat does not need them, it simply leaves those moments alone.
 
 Writes only happen when the plan is valid and fresh, `switch.predbat_set_read_only` is off, and the runtime
 switch is on; every refusal is published as the `reason` attribute on `sensor.predbat_evcc_target_mode`, so

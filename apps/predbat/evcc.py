@@ -652,7 +652,16 @@ class EvccAPI(ComponentBase):
         self.dashboard_item(
             self.entity("sensor", "mode", car_n),
             state=loadpoint.get("mode") or "unknown",
-            attributes={"friendly_name": "Predbat evcc charge mode", "icon": "mdi:ev-station", "loadpoint_id": self.loadpoint_map.get(car_n, 0) + 1, "title": loadpoint.get("title"), "predbat_written": self.written_mode.get(car_n)},
+            attributes={
+                "friendly_name": "Predbat evcc charge mode",
+                "icon": "mdi:ev-station",
+                "loadpoint_id": self.loadpoint_map.get(car_n, 0) + 1,
+                "title": loadpoint.get("title"),
+                "predbat_written": self.written_mode.get(car_n),
+                # What evcc applies by itself when this vehicle connects - so a mode Predbat never
+                # wrote is not blamed on Predbat
+                "vehicle_default_mode": vehicle.get("mode"),
+            },
             app="evcc",
         )
         self.dashboard_item(
@@ -819,17 +828,28 @@ class EvccAPI(ComponentBase):
             return (EVCC_MODE_MINPV if self.use_minpv else EVCC_MODE_PV), reason
         return EVCC_MODE_OFF, reason
 
-    def should_write(self, car_n, mode, reason):
+    def should_write(self, car_n, mode, reason, connected):
         """
         Decide whether the mode may be written, returning (allowed, reason).
 
         Every refusal carries a distinct reason so "why is it not doing anything" can be answered
         from sensor.predbat_evcc_target_mode alone.
+
+        Predbat only speaks when it has something to say. An empty loadpoint is evcc's own business:
+        evcc resets it to the loadpoint's configured mode on disconnect and applies the vehicle's
+        default mode on connect, and writing over either would undo a setting the user chose. idle is
+        the reason publish_car_charging_mode gives its resting state - the absence of a decision
+        rather than a decision to follow the sun - so it is left alone for the same reason. now,
+        solar, export_better, home_battery_low and solar_disabled are all decisions and still written.
         """
         if mode is None:
             return False, reason
         if not self.control:
             return False, "control_disabled"
+        if not connected:
+            return False, "not_connected"
+        if reason == "idle":
+            return False, "no_decision"
         if not self.control_enabled.get(car_n, True):
             return False, "switch_off"
         if self.get_arg("set_read_only", False):
@@ -876,8 +896,15 @@ class EvccAPI(ComponentBase):
                 self.override_until.pop(car_n, None)
             self.last_connected[car_n] = connected
 
+            if not connected:
+                # Forget what was written last session. evcc resets the mode itself on disconnect,
+                # which detect_override would otherwise read as somebody overruling Predbat, and the
+                # first poll of the next session must write even when the mode happens to match.
+                self.written_mode.pop(car_n, None)
+                self.last_write.pop(car_n, None)
+
             mode, reason = self.desired_mode(car_n)
-            allowed, reason = self.should_write(car_n, mode, reason)
+            allowed, reason = self.should_write(car_n, mode, reason, connected)
             written = False
 
             if allowed:
