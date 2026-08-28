@@ -397,7 +397,6 @@ class EvccAPI(ComponentBase):
         # Per-car runtime state, keyed by Predbat car index
         self.sticky_soc = {}
         self.sticky_soc_time = {}
-        self.sticky_vehicle = {}
         self.written_mode = {}
         self.written_priority_soc = None
         self.capped_state = {}
