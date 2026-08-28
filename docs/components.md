@@ -579,7 +579,8 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | `sensor.predbat_evcc_max_power` / `_min_power` / `_power_step` | Charger power band in kW, derived from amps and phases |
 | `sensor.predbat_evcc_charge_power` | Present charging power in W |
 | `sensor.predbat_evcc_mode` | evcc's current charging mode, with the vehicle's own default in `vehicle_default_mode` |
-| `sensor.predbat_evcc_target_mode` | The mode Predbat wants, with a `reason` explaining why it was or was not written |
+| `sensor.predbat_evcc_target_mode` | The mode in effect on the loadpoint: evcc's own while Predbat is not intervening, the borrowed one while it is. `reason` says what Predbat did about it, `predbat_mode` and `decision` what it wanted and why, `write_target` what was actually sent |
+| `sensor.predbat_evcc_restore_mode` | The mode owed back to evcc during a takeover, or `none` |
 | `binary_sensor.predbat_evcc_override` | On when somebody changed the mode in evcc and Predbat has backed off |
 | `switch.predbat_evcc_control` | Runtime kill switch for mode writing (only when `evcc_control` is set) |
 | `sensor.predbat_evcc_priority_soc` | The site's home battery priority SoC. With `evcc_automatic` it also sets **input_number.predbat_car_charging_solar_min_soc**, but only when the value in evcc changes, so your own adjustments are not undone every poll |
@@ -587,34 +588,41 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 
 #### Mode control (evcc)
 
-With `evcc_control: True`, Predbat maps its own decision onto evcc's modes:
+With `evcc_control: True`, Predbat **borrows** the loadpoint rather than driving it. evcc already does
+almost everything Predbat would ask for, so Predbat only steps in for the two decisions evcc cannot reach
+on its own, and hands the loadpoint straight back afterwards:
 
-| Predbat state | evcc mode |
-| ------------- | --------- |
-| `now` - a grid slot is planned | `now` |
-| `solar` - take the surplus | `pv` (or `minpv` with `evcc_use_minpv`) |
-| `off` - the export pays better, or this car does no solar charging | `off` |
+| Predbat decision | Borrowed as | Why evcc cannot do it |
+| ---------------- | ----------- | --------------------- |
+| `now` - `grid_slot` | `now` | evcc does not know the import prices Predbat planned the slot around |
+| `off` - `export_better` | `off` | evcc does not know the surplus is worth more exported than in the car |
 
-The decision is not made here: it is Predbat's own `sensor.predbat_car_charging_mode`, described under
-[the charging mode](car-charging.md#the-charging-mode), so evcc and a plain Home Assistant automation
-driving some other charger act on identical logic. The loadpoint's own departure plan survives either
-mode: `off` stops evcc acting on the plan itself, but the plan is kept, stays editable, and is still
-reported to Predbat.
+Everything else stays evcc's. The resting state is what evcc would do anyway; `home_battery_low` cannot
+even arise for an evcc car, because `evcc_automatic` takes the threshold from evcc's own `prioritySoc`,
+which evcc enforces itself; and `solar_disabled` is Predbat's own modelling switch, not an instruction to
+the charger. The decision itself is still Predbat's `sensor.predbat_car_charging_mode`, described under
+[the charging mode](car-charging.md#the-charging-mode) - this is only about which parts of it are worth
+sending to a charger that is already doing the rest.
 
-**Predbat only writes a mode when it has one to give.** Nothing is written while the loadpoint has no car
-on it, and nothing is written when Predbat's decision is its resting `idle` - both are left to evcc's own
-settings, which already cover them: the loadpoint's `mode` is what evcc resets to when the car is
-unplugged, and the vehicle's `mode` is what evcc applies when it is plugged back in. So a loadpoint you
-set to `off` between sessions stays `off`, and `sensor.predbat_evcc_target_mode` says `not_connected` or
-`no_decision` in its `reason` rather than writing over you. `sensor.predbat_evcc_mode` reports the
-vehicle's own default in `vehicle_default_mode`, so a mode change at plug-in is not mistaken for Predbat's
-doing. Note that evcc's configured defaults are not readable over the API without an `evcc_api_key` -
-Predbat does not need them, it simply leaves those moments alone.
+**A loadpoint is only ever borrowed from `pv` or `minpv`.** Those are the sun-following resting states; `off`
+and `now` are settings you made deliberately, so Predbat leaves them exactly as they are, even for a planned
+grid slot (`sensor.predbat_evcc_target_mode` says `not_resting`). When the slot or the export window ends,
+the mode Predbat found is written back, and `sensor.predbat_evcc_restore_mode` shows what is owed in the
+meantime - it is published, so a Predbat restart mid-slot still hands the loadpoint back rather than
+leaving it in `now`.
+
+Nothing at all is written while no car is connected. That is where evcc's own defaults live: the
+loadpoint's `mode` is what evcc resets to when the car is unplugged, and the vehicle's `mode` is what evcc
+applies when it is plugged back in - so a loadpoint you set to `off` between sessions stays `off`.
+`sensor.predbat_evcc_mode` reports that vehicle default in `vehicle_default_mode`, so a mode change at
+plug-in is not mistaken for Predbat's doing. (evcc's configured defaults are not readable over the API
+without an `evcc_api_key`; Predbat does not need them, it simply leaves those moments alone.)
 
 Writes only happen when the plan is valid and fresh, `switch.predbat_set_read_only` is off, and the runtime
 switch is on; every refusal is published as the `reason` attribute on `sensor.predbat_evcc_target_mode`, so
-"why is nothing happening" is answerable from that entity alone. If you change the mode in evcc's own UI,
-Predbat notices, backs off for `evcc_override_minutes`, and resumes when the next car is plugged in.
+"why is nothing happening" is answerable from that entity alone. If you change the mode in evcc's own UI
+during a takeover, Predbat backs off for `evcc_override_minutes` and abandons the hand-back - the mode you
+chose is now the one that stands, and the next takeover starts from it.
 
 #### Example configuration (evcc)
 

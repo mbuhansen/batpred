@@ -43,6 +43,17 @@ EVCC_MODE_MINPV = "minpv"
 EVCC_MODE_PV = "pv"
 EVCC_MODES = [EVCC_MODE_OFF, EVCC_MODE_NOW, EVCC_MODE_MINPV, EVCC_MODE_PV]
 
+# The sun-following resting modes. These are the only ones Predbat will take a loadpoint out of:
+# off and now are settings the user made deliberately, and evcc is left holding them.
+EVCC_RESTING_MODES = [EVCC_MODE_PV, EVCC_MODE_MINPV]
+
+# Predbat reasons that evcc cannot reach on its own, and the mode each one borrows the loadpoint for.
+# Everything else - the resting state, the home battery priority, an unplugged car - evcc does itself.
+EVCC_TAKEOVER_REASONS = {"grid_slot": EVCC_MODE_NOW, "export_better": EVCC_MODE_OFF}
+
+# Published when no mode is being held on Predbat's behalf, matching the "off" spelling used elsewhere
+NO_RESTORE = "none"
+
 # Go serialises an unset time.Time as its zero value rather than null, and it parses
 # perfectly well into year 1 - so it has to be rejected by prefix, not by exception
 GO_ZERO_TIME_PREFIX = "0001-01-01"
@@ -398,6 +409,7 @@ class EvccAPI(ComponentBase):
         self.sticky_soc = {}
         self.sticky_soc_time = {}
         self.written_mode = {}
+        self.restore_mode = {}
         self.written_priority_soc = None
         self.capped_state = {}
         self.written_solar_enabled = {}
@@ -830,17 +842,15 @@ class EvccAPI(ComponentBase):
 
     def should_write(self, car_n, mode, reason, connected):
         """
-        Decide whether the mode may be written, returning (allowed, reason).
+        Decide whether Predbat may write to this loadpoint at all, returning (allowed, reason).
 
-        Every refusal carries a distinct reason so "why is it not doing anything" can be answered
-        from sensor.predbat_evcc_target_mode alone.
+        This is the "can it" gate; what to write, if anything, is write_target's decision. Every
+        refusal carries a distinct reason so "why is it not doing anything" can be answered from
+        sensor.predbat_evcc_target_mode alone.
 
-        Predbat only speaks when it has something to say. An empty loadpoint is evcc's own business:
-        evcc resets it to the loadpoint's configured mode on disconnect and applies the vehicle's
-        default mode on connect, and writing over either would undo a setting the user chose. idle is
-        the reason publish_car_charging_mode gives its resting state - the absence of a decision
-        rather than a decision to follow the sun - so it is left alone for the same reason. now,
-        solar, export_better, home_battery_low and solar_disabled are all decisions and still written.
+        An empty loadpoint is evcc's own business: evcc resets it to the loadpoint's configured mode
+        on disconnect and applies the vehicle's default mode on connect, and writing over either
+        would undo a setting the user chose.
         """
         if mode is None:
             return False, reason
@@ -848,8 +858,6 @@ class EvccAPI(ComponentBase):
             return False, "control_disabled"
         if not connected:
             return False, "not_connected"
-        if reason == "idle":
-            return False, "no_decision"
         if not self.control_enabled.get(car_n, True):
             return False, "switch_off"
         if self.get_arg("set_read_only", False):
@@ -859,6 +867,53 @@ class EvccAPI(ComponentBase):
         if self.state_time is None or (self.now_utc - self.state_time) > timedelta(seconds=2 * self.poll_seconds):
             return False, "state_stale"
         return True, reason
+
+    def restore_saved_mode(self, car_n):
+        """
+        Seed the borrowed mode from our own published sensor, so a restart mid-episode still hands back.
+
+        Without this a Predbat restart during a grid slot would leave the loadpoint in now with nothing
+        left that knows to undo it - the same reason restore_sticky reads its own sensor back.
+        """
+        if car_n in self.restore_mode:
+            return
+        state = self.get_state_wrapper(entity_id=self.entity("sensor", "restore_mode", car_n))
+        if state in EVCC_RESTING_MODES:
+            self.restore_mode[car_n] = state
+            self.log("EvccAPI: car {} resuming an unfinished takeover, {} is still owed back".format(car_n, state))
+
+    def write_target(self, car_n, reason, observed):
+        """
+        Work out what to write, returning (mode|None, reason).
+
+        Predbat borrows a loadpoint that is resting in a sun-following mode, and only for a decision
+        evcc cannot reach on its own: a planned grid slot, or an export price that beats putting the
+        surplus in the car. When that ends, the borrowed mode is handed straight back.
+
+        Everything else stays evcc's: a loadpoint the user put in off or now is a deliberate setting
+        and is never taken over, the resting state itself is what evcc would do anyway, and the home
+        battery priority is enforced by evcc's own prioritySoc - which is why home_battery_low cannot
+        even arise for an evcc car, see publish_priority_soc.
+        """
+        borrowed = self.restore_mode.get(car_n)
+        takeover = EVCC_TAKEOVER_REASONS.get(reason)
+
+        if takeover:
+            if borrowed:
+                # Mid-episode: keep asserting, so an evcc restart cannot quietly drop it
+                return takeover, reason
+            if observed in EVCC_RESTING_MODES:
+                return takeover, reason
+            return None, "not_resting"
+
+        if borrowed:
+            return borrowed, "restore"
+        return None, "left_to_evcc"
+
+    def drop_takeover(self, car_n, why):
+        """Forget the borrowed mode without handing it back, logging why when there was one."""
+        if self.restore_mode.pop(car_n, None):
+            self.log("EvccAPI: car {} takeover ended ({})".format(car_n, why))
 
     def detect_override(self, car_n, observed):
         """
@@ -890,6 +945,10 @@ class EvccAPI(ComponentBase):
             loadpoint = loadpoints[lp_index]
             observed = loadpoint.get("mode")
 
+            # Seeded before any gate: plan_valid is False on the first cycle after a restart, which is
+            # exactly the cycle where an unfinished takeover has to be recovered rather than published away
+            self.restore_saved_mode(car_n)
+
             # A new session clears any standing override
             connected = bool(loadpoint.get("connected"))
             if connected and not self.last_connected.get(car_n, False):
@@ -897,34 +956,68 @@ class EvccAPI(ComponentBase):
             self.last_connected[car_n] = connected
 
             if not connected:
-                # Forget what was written last session. evcc resets the mode itself on disconnect,
-                # which detect_override would otherwise read as somebody overruling Predbat, and the
-                # first poll of the next session must write even when the mode happens to match.
+                # Nothing is owed back to an empty loadpoint: evcc resets the mode itself on
+                # disconnect, which also means detect_override would read that reset as somebody
+                # overruling Predbat, and that the first poll of the next session must write even
+                # when the mode happens to match what was written a session ago.
                 self.written_mode.pop(car_n, None)
                 self.last_write.pop(car_n, None)
+                self.drop_takeover(car_n, "disconnected")
 
-            mode, reason = self.desired_mode(car_n)
-            allowed, reason = self.should_write(car_n, mode, reason, connected)
+            mode, decision = self.desired_mode(car_n)
+            allowed, reason = self.should_write(car_n, mode, decision, connected)
+            target = None
             written = False
 
             if allowed:
-                if self.detect_override(car_n, observed):
-                    reason = "overridden"
-                else:
-                    refresh_due = self.mode_refresh_minutes and (car_n not in self.last_write or (self.now_utc - self.last_write[car_n]) > timedelta(minutes=self.mode_refresh_minutes))
-                    if self.written_mode.get(car_n) != mode or refresh_due:
-                        if await self.client.set_mode(lp_index + 1, mode):
-                            self.written_mode[car_n] = mode
-                            self.last_write[car_n] = self.now_utc
-                            written = True
-                            self.log("EvccAPI: loadpoint {} mode -> {} ({})".format(lp_index + 1, mode, reason))
-                        else:
-                            reason = "write_failed"
+                target, reason = self.write_target(car_n, decision, observed)
 
+            if target and self.restore_mode.get(car_n) and self.detect_override(car_n, observed):
+                # Only mid-episode is there anything to override - outside one Predbat is not writing,
+                # so a mode the user sets is simply the state it will next borrow from, or not
+                self.drop_takeover(car_n, "overridden in evcc")
+                target, reason = None, "overridden"
+
+            if target:
+                refresh_due = self.mode_refresh_minutes and (car_n not in self.last_write or (self.now_utc - self.last_write[car_n]) > timedelta(minutes=self.mode_refresh_minutes))
+                if self.written_mode.get(car_n) != target or refresh_due:
+                    if await self.client.set_mode(lp_index + 1, target):
+                        self.written_mode[car_n] = target
+                        self.last_write[car_n] = self.now_utc
+                        written = True
+                        if reason == "restore":
+                            self.drop_takeover(car_n, "handed back")
+                        elif not self.restore_mode.get(car_n):
+                            self.restore_mode[car_n] = observed
+                            self.log("EvccAPI: car {} borrowing loadpoint {} from {} ({})".format(car_n, lp_index + 1, observed, reason))
+                        self.log("EvccAPI: loadpoint {} mode -> {} ({})".format(lp_index + 1, target, reason))
+                    else:
+                        reason = "write_failed"
+
+            # The mode that actually applies: the borrowed one while Predbat is holding the loadpoint,
+            # evcc's own the rest of the time. Predbat's untranslated decision stays in predbat_mode,
+            # so a takeover that was refused is still visible without the state having to lie about it
             self.dashboard_item(
                 self.entity("sensor", "target_mode", car_n),
-                state=mode or "unknown",
-                attributes={"friendly_name": "Predbat evcc target mode", "icon": "mdi:ev-station", "reason": reason, "written": written, "evcc_mode": observed, "allowed": allowed},
+                state=target or observed or "unknown",
+                attributes={
+                    "friendly_name": "Predbat evcc target mode",
+                    "icon": "mdi:ev-station",
+                    "reason": reason,
+                    "decision": decision,
+                    "predbat_mode": mode,
+                    "write_target": target,
+                    "written": written,
+                    "evcc_mode": observed,
+                    "borrowed": bool(self.restore_mode.get(car_n)),
+                    "allowed": allowed,
+                },
+                app="evcc",
+            )
+            self.dashboard_item(
+                self.entity("sensor", "restore_mode", car_n),
+                state=self.restore_mode.get(car_n) or NO_RESTORE,
+                attributes={"friendly_name": "Predbat evcc mode to restore", "icon": "mdi:backup-restore", "borrowed": bool(self.restore_mode.get(car_n))},
                 app="evcc",
             )
             self.dashboard_item(
