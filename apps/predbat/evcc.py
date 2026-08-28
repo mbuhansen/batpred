@@ -205,6 +205,28 @@ def resolve_plan(vehicle, loadpoint, now, local_tz, log=None):
     return {"time": None, "soc": None, "source": "none"}
 
 
+def effective_limit(loadpoint, vehicle):
+    """
+    Resolve the standing SoC limit evcc will actually stop at, or None when there is none.
+
+    evcc's own effectiveLimitSoc already resolves the loadpoint's session limit over the vehicle's
+    standing one, so it is preferred; the vehicle value is only a fallback for an older evcc that
+    does not report the effective field. A 0 means "no limit" rather than "stop now", and so does
+    anything outside 0-100, which is why this returns None instead of a number to clamp with.
+    """
+    for source in (loadpoint or {}, vehicle or {}):
+        for field in ("effectiveLimitSoc", "limitSoc"):
+            if field not in source:
+                continue
+            try:
+                value = float(source[field])
+            except (TypeError, ValueError):
+                continue
+            if 0 < value <= 100:
+                return value
+    return None
+
+
 def derive_power_band(loadpoint, voltage):
     """
     Derive the charger's (min_kw, max_kw, step_kw) from evcc's current and phase configuration.
@@ -378,6 +400,7 @@ class EvccAPI(ComponentBase):
         self.sticky_vehicle = {}
         self.written_mode = {}
         self.written_priority_soc = None
+        self.capped_state = {}
         self.written_solar_enabled = {}
         self.last_write = {}
         self.override_until = {}
@@ -538,6 +561,22 @@ class EvccAPI(ComponentBase):
 
     # ------------------------------------------------------------------ publishing
 
+    def log_cap(self, car_n, plan_soc, standing, capped):
+        """
+        Log the plan target being capped by the standing limit, once per transition.
+
+        Only on change, like publish_priority_soc and publish_solar_enabled - the poll runs every
+        minute and a line each time would bury everything else in the log. Not capped is the
+        assumed starting point, so an ordinary car does not announce itself on the first poll.
+        """
+        if self.capped_state.get(car_n, False) == capped:
+            return
+        self.capped_state[car_n] = capped
+        if capped:
+            self.log("EvccAPI: car {} plan target {}% capped to the evcc limit of {}%".format(car_n, dp2(plan_soc), dp2(standing)))
+        else:
+            self.log("EvccAPI: car {} plan target is no longer capped by the evcc limit".format(car_n))
+
     def publish_car(self, car_n, loadpoint):
         """Publish every entity for one car from its loadpoint and vehicle."""
         vehicle_key, vehicle = self.vehicle_for(loadpoint)
@@ -569,19 +608,33 @@ class EvccAPI(ComponentBase):
         )
 
         # Never publish 0 here - get_arg would take it at face value and plan nothing. When there
-        # is no usable plan the vehicle's standing limit applies instead.
+        # is no usable plan the standing limit applies on its own instead.
+        standing = effective_limit(loadpoint, vehicle)
         limit = plan["soc"] if (ready != NO_PLAN and plan["soc"]) else None
+        capped = bool(limit and standing and standing < limit)
+        if capped:
+            # evcc stops at the standing limit whatever the plan asks for, so planning grid slots
+            # for the difference would buy import the car is never going to take
+            limit = standing
         if not limit:
-            limit = vehicle.get("limitSoc") or loadpoint.get("effectiveLimitSoc") or 100
+            limit = standing or 100
+        self.log_cap(car_n, plan["soc"], standing, capped)
         self.dashboard_item(
             self.entity("sensor", "plan_soc", car_n),
             state=dp2(limit),
-            attributes={"friendly_name": "Predbat evcc car charge limit", "unit_of_measurement": "%", "icon": "mdi:battery-charging-100", "plan_source": plan["source"], "plan_soc": plan["soc"]},
+            attributes={
+                "friendly_name": "Predbat evcc car charge limit",
+                "unit_of_measurement": "%",
+                "icon": "mdi:battery-charging-100",
+                "plan_source": plan["source"],
+                "plan_soc": plan["soc"],
+                "effective_limit_soc": standing,
+                "capped": capped,
+            },
             app="evcc",
         )
 
-        solar_limit = vehicle.get("limitSoc") or loadpoint.get("effectiveLimitSoc") or 100
-        self.dashboard_item(self.entity("sensor", "limit_soc", car_n), state=dp2(solar_limit), attributes={"friendly_name": "Predbat evcc car solar limit", "unit_of_measurement": "%", "icon": "mdi:solar-power-variant"}, app="evcc")
+        self.dashboard_item(self.entity("sensor", "limit_soc", car_n), state=dp2(standing or 100), attributes={"friendly_name": "Predbat evcc car solar limit", "unit_of_measurement": "%", "icon": "mdi:solar-power-variant"}, app="evcc")
 
         min_kw, max_kw, step_kw = derive_power_band(loadpoint, self.phase_voltage)
         if max_kw:
@@ -879,7 +932,7 @@ class EvccAPI(ComponentBase):
         if not loadpoints:
             missing.append("loadpoints")
         else:
-            for field in ("connected", "charging", "mode", "minCurrent", "maxCurrent", "phasesActive"):
+            for field in ("connected", "charging", "mode", "minCurrent", "maxCurrent", "phasesActive", "effectiveLimitSoc"):
                 if field not in loadpoints[0]:
                     missing.append("loadpoints[0].{}".format(field))
         if "vehicles" not in self.state:
