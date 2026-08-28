@@ -546,16 +546,17 @@ and Off when it should be sold.
 
 Rather than leaving you to combine that sensor with **binary_sensor.predbat_car_charging_slot**, Predbat publishes the
 decision itself as **sensor.predbat_car_charging_mode** (`_1`, `_2`, … for further cars), with a `reason` attribute
-saying why. This is what an external charger should follow - the [evcc component](components.md#evcc-ev-charger-evcc)
-maps it straight onto evcc's own modes, and a Home Assistant automation driving any other charger can read the same
-sensor and get identical behaviour.
+saying why. This is what an external charger should follow - a Home Assistant automation driving any charger can read
+this sensor and get the full behaviour. The [evcc component](components.md#evcc-ev-charger-evcc) acts only on the two
+rows marked below: evcc already does the rest itself, and Predbat leaves those to it rather than overwriting a mode you
+chose.
 
 | Mode | `reason` | Meaning |
 |---|---|---|
-| `now` | `grid_slot` | Predbat has planned a grid slot to hit your target - charge at full rate (evcc: `now`) |
-| `solar` | `solar` | Take the surplus, it is worth less exported than the charge it displaces (evcc: `pv`, or `minpv` with `evcc_use_minpv`) |
-| `solar` | `idle` | Nothing planned and the car is not plugged in - keep following the sun (evcc: `pv`) |
-| `off` | `export_better` | Sell the surplus instead; the car is charged from the planned cheap slots |
+| `now` | `grid_slot` | Predbat has planned a grid slot to hit your target - charge at full rate (evcc: borrowed as `now`) |
+| `solar` | `solar` | Take the surplus, it is worth less exported than the charge it displaces |
+| `solar` | `idle` | Nothing planned and the car is not plugged in - keep following the sun |
+| `off` | `export_better` | Sell the surplus instead; the car is charged from the planned cheap slots (evcc: borrowed as `off`) |
 | `off` | `home_battery_low` | The home battery is below **car_charging_solar_min_soc** and nothing else is enforcing it, so Predbat does |
 | `off` | `solar_disabled` | This car does not do solar charging (`car_charging_solar` is off) |
 

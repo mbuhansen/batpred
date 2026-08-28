@@ -439,9 +439,23 @@ def test_desired_mode_and_gates():
     set_mode("solar", "idle")
     check("allowed", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (True, "export_better"), failures)
     check("mode_none", api.should_write(0, None, "no_plan_yet", True)[1], "no_plan_yet", failures)
-    # An empty loadpoint, and a decision Predbat has not made, are both left to evcc
+    # An empty loadpoint is evcc's own business
     check("not_connected", api.should_write(0, EVCC_MODE_PV, "idle", False), (False, "not_connected"), failures)
-    check("no_decision", api.should_write(0, EVCC_MODE_PV, "idle", True), (False, "no_decision"), failures)
+
+    # What to write, given evcc's current mode, is write_target's decision
+    check("takeover_now", api.write_target(0, "grid_slot", EVCC_MODE_PV), (EVCC_MODE_NOW, "grid_slot"), failures)
+    check("takeover_from_minpv", api.write_target(0, "export_better", EVCC_MODE_MINPV), (EVCC_MODE_OFF, "export_better"), failures)
+    # A loadpoint the user put in off or now is a deliberate setting and is never taken over
+    check("not_resting_off", api.write_target(0, "grid_slot", EVCC_MODE_OFF), (None, "not_resting"), failures)
+    check("not_resting_now", api.write_target(0, "export_better", EVCC_MODE_NOW), (None, "not_resting"), failures)
+    # Everything else evcc does itself - the resting state, a car doing no solar, the battery priority
+    for reason in ("idle", "solar", "solar_disabled", "home_battery_low"):
+        check("left_to_evcc_{}".format(reason), api.write_target(0, reason, EVCC_MODE_PV), (None, "left_to_evcc"), failures)
+    # Mid-episode the borrowed mode is asserted, then handed straight back when the reason goes away
+    api.restore_mode[0] = EVCC_MODE_PV
+    check("holds", api.write_target(0, "grid_slot", EVCC_MODE_NOW), (EVCC_MODE_NOW, "grid_slot"), failures)
+    check("restores", api.write_target(0, "idle", EVCC_MODE_NOW), (EVCC_MODE_PV, "restore"), failures)
+    api.restore_mode.pop(0)
 
     api.control = False
     check("control_disabled", api.should_write(0, EVCC_MODE_OFF, "export_better", True), (False, "control_disabled"), failures)
@@ -491,13 +505,12 @@ def test_override_detection():
 
 
 def test_apply_modes_writes():
-    """apply_modes writes on change, re-asserts periodically, and clears the override on connect"""
+    """A takeover is asserted, re-asserted, handed back, and abandoned when the user overrules it"""
     print("**** Running Test: evcc_apply_modes ****")
     failures = []
     api = MockEvccAPI(host="http://evcc", control=True, mode_refresh_minutes=15)
-    # Connected throughout: an empty loadpoint is evcc's own business and is never written to,
-    # which test_no_write_without_a_decision covers
-    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="off", connected=True)]}
+    # Resting in pv and connected: the one state Predbat is allowed to borrow from
+    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=EVCC_MODE_PV, connected=True)]}
     api.state_time = api.now_utc
     api.loadpoint_map = {0: 0}
     api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
@@ -514,6 +527,10 @@ def test_apply_modes_writes():
     run_async(api.apply_modes())
     check("wrote_now", writes, [(1, EVCC_MODE_NOW)], failures)
     check("target_sensor", api.entities["sensor.predbat_evcc_target_mode"]["state"], EVCC_MODE_NOW, failures)
+    check("target_predbat_mode", api.entities["sensor.predbat_evcc_target_mode"]["attributes"]["predbat_mode"], EVCC_MODE_NOW, failures)
+    # pv is now owed back, and published so a restart can still hand it over
+    check("borrowed", api.restore_mode.get(0), EVCC_MODE_PV, failures)
+    check("restore_sensor", api.entities["sensor.predbat_evcc_restore_mode"]["state"], EVCC_MODE_PV, failures)
 
     # Unchanged and not yet due for a refresh -> no second write
     api.state["loadpoints"][0]["mode"] = EVCC_MODE_NOW
@@ -524,72 +541,37 @@ def test_apply_modes_writes():
     api.last_write[0] = api.now_utc - timedelta(minutes=20)
     run_async(api.apply_modes())
     check("reasserted", len(writes), 2, failures)
+    check("still_borrowed", api.restore_mode.get(0), EVCC_MODE_PV, failures)
 
-    # A user changing the mode in evcc stops further writes
-    api.state["loadpoints"][0]["mode"] = "off"
+    # The slot ends: the borrowed mode goes straight back and nothing is owed any more
+    api.entities["sensor.predbat_car_charging_mode"] = {"state": "solar", "attributes": {"reason": "idle"}}
     run_async(api.apply_modes())
-    check("override_no_write", len(writes), 2, failures)
+    check("handed_back", writes[-1], (1, EVCC_MODE_PV), failures)
+    check("nothing_owed", api.restore_mode.get(0), None, failures)
+    check("restore_cleared", api.entities["sensor.predbat_evcc_restore_mode"]["state"], "none", failures)
+
+    # Resting again: no further writes
+    api.state["loadpoints"][0]["mode"] = EVCC_MODE_PV
+    run_async(api.apply_modes())
+    check("resting_quiet", len(writes), 3, failures)
+
+    # A user changing the mode mid-takeover stops the writes and abandons the hand-back
+    api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
+    run_async(api.apply_modes())
+    check("borrowed_again", writes[-1], (1, EVCC_MODE_NOW), failures)
+    api.state["loadpoints"][0]["mode"] = EVCC_MODE_OFF
+    run_async(api.apply_modes())
+    check("override_no_write", len(writes), 4, failures)
     check("override_sensor", api.entities["binary_sensor.predbat_evcc_override"]["state"], "on", failures)
-
-    # Unplugging and plugging a car back in is a new intent, so control resumes
-    api.state["loadpoints"][0]["connected"] = False
-    run_async(api.apply_modes())
-    check("unplugged_no_write", len(writes), 2, failures)
-    api.state["loadpoints"][0]["connected"] = True
-    run_async(api.apply_modes())
-    check("resumed_on_connect", len(writes), 3, failures)
+    check("override_forgets", api.restore_mode.get(0), None, failures)
     return failures
 
 
-def test_no_write_without_a_decision():
-    """An empty loadpoint, and a car with nothing planned, are left to evcc's own defaults"""
-    print("**** Running Test: evcc_no_write ****")
+def test_only_borrows_a_resting_loadpoint():
+    """Predbat writes only to take a pv loadpoint for a slot or an export, and only until it ends"""
+    print("**** Running Test: evcc_takeover ****")
     failures = []
 
-    def build(mode_state, reason, connected, observed="off"):
-        """Drive apply_modes once for one Predbat decision, returning (component, writes)."""
-        api = MockEvccAPI(host="http://evcc", control=True, mode_refresh_minutes=15)
-        api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=observed, connected=connected)], "vehicles": SAMPLE_STATE["vehicles"]}
-        api.state_time = api.now_utc
-        api.loadpoint_map = {0: 0}
-        api.entities["sensor.predbat_car_charging_mode"] = {"state": mode_state, "attributes": {"reason": reason}}
-        writes = []
-
-        async def fake_set_mode(loadpoint_id, mode):
-            """Record the write instead of performing it."""
-            writes.append((loadpoint_id, mode))
-            return True
-
-        api.client.set_mode = fake_set_mode
-        run_async(api.apply_modes())
-        return api, writes
-
-    # No car on the loadpoint: evcc's own reset-on-disconnect mode stands, whatever Predbat rests at
-    api, writes = build("solar", "idle", connected=False)
-    check("empty_no_write", writes, [], failures)
-    target = api.entities["sensor.predbat_evcc_target_mode"]
-    check("empty_reason", target["attributes"]["reason"], "not_connected", failures)
-    check("empty_not_allowed", target["attributes"]["allowed"], False, failures)
-    # The mode Predbat would have wanted is still shown, so the sensor stays readable
-    check("empty_target", target["state"], EVCC_MODE_PV, failures)
-
-    # Connected but nothing decided - idle is an absence, not a decision to follow the sun
-    _, writes = build("solar", "idle", connected=True)
-    check("idle_no_write", writes, [], failures)
-    api, _ = build("solar", "idle", connected=True)
-    check("idle_reason", api.entities["sensor.predbat_evcc_target_mode"]["attributes"]["reason"], "no_decision", failures)
-
-    # Every real decision is still written
-    for state, reason, expected in (("now", "grid_slot", EVCC_MODE_NOW), ("solar", "solar", EVCC_MODE_PV), ("off", "export_better", EVCC_MODE_OFF), ("off", "home_battery_low", EVCC_MODE_OFF)):
-        _, writes = build(state, reason, connected=True)
-        check("writes_{}".format(reason), writes, [(1, expected)], failures)
-
-    # evcc resetting the mode itself on disconnect must not read as somebody overruling Predbat
-    api = MockEvccAPI(host="http://evcc", control=True, override_minutes=60)
-    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode="now", connected=True)]}
-    api.state_time = api.now_utc
-    api.loadpoint_map = {0: 0}
-    api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
     writes = []
 
     async def fake_set_mode(loadpoint_id, mode):
@@ -597,29 +579,96 @@ def test_no_write_without_a_decision():
         writes.append((loadpoint_id, mode))
         return True
 
+    def build(mode_state, reason, connected=True, observed=EVCC_MODE_PV):
+        """Drive apply_modes once for one Predbat decision, returning (component, writes)."""
+        del writes[:]
+        api = MockEvccAPI(host="http://evcc", control=True, mode_refresh_minutes=15)
+        api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=observed, connected=connected)], "vehicles": SAMPLE_STATE["vehicles"]}
+        api.state_time = api.now_utc
+        api.loadpoint_map = {0: 0}
+        api.entities["sensor.predbat_car_charging_mode"] = {"state": mode_state, "attributes": {"reason": reason}}
+        api.client.set_mode = fake_set_mode
+        run_async(api.apply_modes())
+        return api, list(writes)
+
+    # No car on the loadpoint: evcc's own reset-on-disconnect mode stands, whatever Predbat rests at
+    api, done = build("solar", "idle", connected=False)
+    check("empty_no_write", done, [], failures)
+    target = api.entities["sensor.predbat_evcc_target_mode"]
+    check("empty_reason", target["attributes"]["reason"], "not_connected", failures)
+    check("empty_not_allowed", target["attributes"]["allowed"], False, failures)
+    # The sensor shows the mode that actually applies - evcc's own - not the one Predbat rests at,
+    # which stays visible in predbat_mode
+    check("empty_shows_evcc", target["state"], EVCC_MODE_PV, failures)
+    check("empty_predbat_mode", target["attributes"]["predbat_mode"], EVCC_MODE_PV, failures)
+
+    # The two decisions evcc cannot reach on its own, from either resting mode
+    for observed in (EVCC_MODE_PV, EVCC_MODE_MINPV):
+        _, done = build("now", "grid_slot", observed=observed)
+        check("slot_from_{}".format(observed), done, [(1, EVCC_MODE_NOW)], failures)
+        _, done = build("off", "export_better", observed=observed)
+        check("export_from_{}".format(observed), done, [(1, EVCC_MODE_OFF)], failures)
+
+    # Everything else is evcc's own job and is never written
+    for state, reason in (("solar", "idle"), ("solar", "solar"), ("off", "solar_disabled"), ("off", "home_battery_low")):
+        api, done = build(state, reason)
+        check("quiet_{}".format(reason), done, [], failures)
+        check("quiet_reason_{}".format(reason), api.entities["sensor.predbat_evcc_target_mode"]["attributes"]["reason"], "left_to_evcc", failures)
+        check("quiet_state_{}".format(reason), api.entities["sensor.predbat_evcc_target_mode"]["state"], EVCC_MODE_PV, failures)
+
+    # A loadpoint the user has set to off or now is a deliberate choice, so even a slot leaves it alone
+    for observed in (EVCC_MODE_OFF, EVCC_MODE_NOW):
+        api, done = build("now", "grid_slot", observed=observed)
+        check("not_resting_{}".format(observed), done, [], failures)
+        target = api.entities["sensor.predbat_evcc_target_mode"]
+        check("not_resting_reason_{}".format(observed), target["attributes"]["reason"], "not_resting", failures)
+        # The state follows evcc, while the refused takeover stays readable in the attributes
+        check("not_resting_state_{}".format(observed), target["state"], observed, failures)
+        check("not_resting_wanted_{}".format(observed), target["attributes"]["predbat_mode"], EVCC_MODE_NOW, failures)
+
+    # evcc resetting the mode itself on disconnect must not read as somebody overruling Predbat
+    api = MockEvccAPI(host="http://evcc", control=True, override_minutes=60)
+    api.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=EVCC_MODE_PV, connected=True)]}
+    api.state_time = api.now_utc
+    api.loadpoint_map = {0: 0}
+    api.entities["sensor.predbat_car_charging_mode"] = {"state": "now", "attributes": {"reason": "grid_slot"}}
+    del writes[:]
     api.client.set_mode = fake_set_mode
     run_async(api.apply_modes())
     check("session_wrote", writes, [(1, EVCC_MODE_NOW)], failures)
 
-    # Unplug: evcc puts the loadpoint back to its own default
-    api.state["loadpoints"][0].update(connected=False, mode="off")
+    # Unplug: evcc puts the loadpoint back to its own default and nothing is owed back any more
+    api.state["loadpoints"][0].update(connected=False, mode=EVCC_MODE_OFF)
     run_async(api.apply_modes())
     check("reset_no_override", api.entities["binary_sensor.predbat_evcc_override"]["state"], "off", failures)
     check("reset_no_write", len(writes), 1, failures)
+    check("reset_forgets", api.restore_mode.get(0), None, failures)
 
-    # A new session writes again straight away, even though the wanted mode has not changed
-    api.state["loadpoints"][0].update(connected=True)
+    # A new session resting in pv borrows again straight away
+    api.state["loadpoints"][0].update(connected=True, mode=EVCC_MODE_PV)
     run_async(api.apply_modes())
     check("new_session_writes", len(writes), 2, failures)
+
+    # A restart mid-takeover recovers what is owed from the sensor it published
+    restarted = MockEvccAPI(host="http://evcc", control=True)
+    restarted.state = {"loadpoints": [dict(SAMPLE_STATE["loadpoints"][0], mode=EVCC_MODE_NOW, connected=True)]}
+    restarted.state_time = restarted.now_utc
+    restarted.loadpoint_map = {0: 0}
+    restarted.entities["sensor.predbat_evcc_restore_mode"] = {"state": EVCC_MODE_PV, "attributes": {}}
+    restarted.entities["sensor.predbat_car_charging_mode"] = {"state": "solar", "attributes": {"reason": "idle"}}
+    del writes[:]
+    restarted.client.set_mode = fake_set_mode
+    run_async(restarted.apply_modes())
+    check("restart_hands_back", writes, [(1, EVCC_MODE_PV)], failures)
 
     # The vehicle's own default mode is published, so a mode Predbat never wrote is not blamed on it
     api = MockEvccAPI(host="http://evcc")
     state = copy.deepcopy(SAMPLE_STATE)
-    state["vehicles"]["db:3"]["mode"] = "pv"
+    state["vehicles"]["db:3"]["mode"] = EVCC_MODE_PV
     api.state = state
     api.loadpoint_map = {0: 0}
     api.publish_car(0, state["loadpoints"][0])
-    check("vehicle_default", api.entities["sensor.predbat_evcc_mode"]["attributes"]["vehicle_default_mode"], "pv", failures)
+    check("vehicle_default", api.entities["sensor.predbat_evcc_mode"]["attributes"]["vehicle_default_mode"], EVCC_MODE_PV, failures)
     return failures
 
 
@@ -914,7 +963,7 @@ def test_evcc(my_predbat=None):
         test_priority_soc,
         test_override_detection,
         test_apply_modes_writes,
-        test_no_write_without_a_decision,
+        test_only_borrows_a_resting_loadpoint,
         test_client_http,
         test_registry_and_schema,
         test_run_cycle,
