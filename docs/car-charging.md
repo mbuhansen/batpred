@@ -475,7 +475,8 @@ Configuration (all per-car, set in `apps.yaml` unless noted):
   (1A on a 3-phase charger is about 0.69kW), so they charge at the largest discrete level at or below the surplus and leave a small remainder to the home battery/export.
   Set this to model that quantisation; leave at 0 to let the car follow the surplus exactly.
 - **car_charging_solar_limit** - the SoC (%) the opportunistic solar charging fills the car to, **independent of the grid plan target** (`car_charging_limit`).
-  Defaults to `car_charging_limit` when not set. With EVCC this is the loadpoint's limit SoC (its PV cap), while `car_charging_limit` is the departure plan target.
+  Defaults to `car_charging_limit` when not set. With EVCC this is the loadpoint's limit SoC (its PV cap), while `car_charging_limit` is the departure plan target -
+  capped by that same limit, since EVCC stops there whether the charge came from the sun or the grid.
 - **input_number.predbat_car_charging_solar_min_soc** - home battery SoC threshold (%) in Home Assistant. The car only takes solar once the home battery is above this level,
   so the home battery is charged first. Default 0%. It applies to both the forecast and the decision Predbat publishes, so a charger following
   **sensor.predbat_car_charging_mode** stops diverting below it as well - see the `home_battery_low` reason above. This is yours to set for any charger - with the [evcc component](components.md#evcc-ev-charger-evcc) and

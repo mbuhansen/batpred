@@ -15,6 +15,7 @@ has to keep working against as evcc's schema drifts.
 """
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+import copy
 
 import pytz
 
@@ -330,6 +331,8 @@ def test_publish_and_auto_config():
     # 11:54 UTC is 13:54 in Copenhagen, so the next plan is the weekday 15:00 one
     check("plan_time", api.entities["sensor.predbat_evcc_plan_time"]["state"], "15:00:00", failures)
     check("plan_soc", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 70, failures)
+    # 70 is the plan's own target here, not the 100% loadpoint limit cutting it down
+    check("plan_uncapped", api.entities["sensor.predbat_evcc_plan_soc"]["attributes"]["capped"], False, failures)
     check("max_power", api.entities["sensor.predbat_evcc_max_power"]["state"], 3.68, failures)
     check("connected", api.entities["binary_sensor.predbat_evcc_connected"]["state"], "off", failures)
     # The single configured vehicle is resolved even though the loadpoint reports no vehicleName
@@ -709,6 +712,95 @@ def test_priority_soc():
     return failures
 
 
+def build_state(loadpoint=None, vehicle=None, remove=()):
+    """Copy SAMPLE_STATE with the loadpoint and vehicle fields a limit test needs changed."""
+    state = copy.deepcopy(SAMPLE_STATE)
+    lp = state["loadpoints"][0]
+    for key in remove:
+        lp.pop(key, None)
+    lp.update(loadpoint or {})
+    state["vehicles"]["db:3"].update(vehicle or {})
+    return state
+
+
+def publish(state, now=None):
+    """Publish one car from a state and hand back the component so its entities can be read."""
+    api = MockEvccAPI(host="http://evcc", now=now)
+    api.state = state
+    api.loadpoint_map = {0: 0}
+    api.publish_car(0, state["loadpoints"][0])
+    return api
+
+
+def test_effective_limit_caps_plan():
+    """The loadpoint limit caps the plan target - evcc stops there whatever the plan asks for"""
+    print("**** Running Test: evcc_effective_limit ****")
+    failures = []
+
+    # The reported case: a 100% departure plan with the loadpoint dialled down to 70%. The default
+    # clock is 15:54 in Copenhagen on a Tuesday, so the next plan is tomorrow's 07:30 one at 100%
+    api = publish(build_state(loadpoint={"effectiveLimitSoc": 70}))
+    plan_soc = api.entities["sensor.predbat_evcc_plan_soc"]
+    check("capped_state", plan_soc["state"], 70, failures)
+    check("capped_flag", plan_soc["attributes"]["capped"], True, failures)
+    check("capped_raw_plan", plan_soc["attributes"]["plan_soc"], 100, failures)
+    check("capped_limit_attr", plan_soc["attributes"]["effective_limit_soc"], 70, failures)
+    # The departure itself is untouched - only the target it charges to moves
+    check("capped_plan_time", api.entities["sensor.predbat_evcc_plan_time"]["state"], "07:30:00", failures)
+    check("capped_logged", any("capped to the evcc limit of 70" in line for line in api.log_messages), True, failures)
+
+    # A limit above the plan changes nothing. 13:54 local picks the 15:00 plan at 70%
+    api = publish(build_state(loadpoint={"effectiveLimitSoc": 90}), now=datetime(2026, 8, 11, 11, 54, tzinfo=timezone.utc))
+    check("above_state", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 70, failures)
+    check("above_flag", api.entities["sensor.predbat_evcc_plan_soc"]["attributes"]["capped"], False, failures)
+    check("above_quiet", any("capped to the evcc limit" in line for line in api.log_messages), False, failures)
+
+    # 0 means "no limit", not "stop now" - the plan target has to survive it
+    api = publish(build_state(loadpoint={"effectiveLimitSoc": 0}))
+    check("zero_state", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 100, failures)
+    check("zero_flag", api.entities["sensor.predbat_evcc_plan_soc"]["attributes"]["capped"], False, failures)
+    check("zero_solar", api.entities["sensor.predbat_evcc_limit_soc"]["state"], 100, failures)
+
+    # An older evcc without the effective field falls back to the vehicle's own limit
+    api = publish(build_state(vehicle={"limitSoc": 80}, remove=("effectiveLimitSoc",)))
+    check("fallback_state", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 80, failures)
+    check("fallback_solar", api.entities["sensor.predbat_evcc_limit_soc"]["state"], 80, failures)
+
+    # ...and with nothing to go on at all, neither sensor invents a limit below 100
+    api = publish(build_state(remove=("effectiveLimitSoc", "limitSoc")))
+    check("none_state", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 100, failures)
+    check("none_solar", api.entities["sensor.predbat_evcc_limit_soc"]["state"], 100, failures)
+
+    # evcc's effectiveLimitSoc already resolves the session limit over the vehicle's standing one,
+    # so it wins - reading the vehicle first would report 100 for a loadpoint that stops at 70
+    api = publish(build_state(loadpoint={"effectiveLimitSoc": 70}, vehicle={"limitSoc": 100}))
+    check("precedence_plan", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 70, failures)
+    check("precedence_solar", api.entities["sensor.predbat_evcc_limit_soc"]["state"], 70, failures)
+
+    # With no plan at all the limit applies on its own, as it always has
+    state = build_state(loadpoint={"effectiveLimitSoc": 70})
+    state["vehicles"]["db:3"]["repeatingPlans"] = None
+    api = publish(state)
+    check("no_plan_time", api.entities["sensor.predbat_evcc_plan_time"]["state"], "off", failures)
+    check("no_plan_state", api.entities["sensor.predbat_evcc_plan_soc"]["state"], 70, failures)
+    check("no_plan_flag", api.entities["sensor.predbat_evcc_plan_soc"]["attributes"]["capped"], False, failures)
+
+    # The log line is once per transition, not once per poll
+    api = MockEvccAPI(host="http://evcc")
+    capped_state = build_state(loadpoint={"effectiveLimitSoc": 70})
+    api.state = capped_state
+    api.loadpoint_map = {0: 0}
+    api.publish_car(0, capped_state["loadpoints"][0])
+    api.publish_car(0, capped_state["loadpoints"][0])
+    check("logged_once", len([line for line in api.log_messages if "capped to the evcc limit" in line]), 1, failures)
+    # ...and raising the limit back up says so, so the log explains both directions
+    open_state = build_state(loadpoint={"effectiveLimitSoc": 100})
+    api.state = open_state
+    api.publish_car(0, open_state["loadpoints"][0])
+    check("uncapped_logged", any("no longer capped" in line for line in api.log_messages), True, failures)
+    return failures
+
+
 def test_evcc(my_predbat=None):
     """
     Run the evcc component tests, returns True on failure
@@ -725,6 +817,7 @@ def test_evcc(my_predbat=None):
         test_host_normalisation,
         test_loadpoint_mapping,
         test_publish_and_auto_config,
+        test_effective_limit_caps_plan,
         test_sticky_soc,
         test_desired_mode_and_gates,
         test_solar_enabled_switch,

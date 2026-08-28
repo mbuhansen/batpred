@@ -536,6 +536,10 @@ becomes a 1.38kW minimum, 3.68kW maximum and a 0.23kW step - instead of you work
   your `apps.yaml` is left alone and listed in the `overridden` attribute of `sensor.predbat_evcc_status`.
   This matters most for `car_charging_soc`: if you have a car integration in Home Assistant that reports a
   live SoC while the car is away, keep pointing at it - evcc only knows the SoC it last saw while connected.
+- **Turning the limit down in evcc lowers Predbat's target too.** The loadpoint's limit SoC caps the
+  departure plan's target, because evcc stops there whatever the plan asks for - so a plan for 100%
+  with the loadpoint dialled back to 70% plans grid slots for 70%, rather than buying import for
+  charge that is never delivered. `sensor.predbat_evcc_plan_soc` says so in its `capped` attribute.
 - Mode control is off by default. Enable it deliberately with `evcc_control: True`.
 - `car_charging_energy` is **not** auto-configured; evcc reports session energy in Wh and the unit is not
   consistent across versions, so wire it yourself if you want it.
@@ -570,8 +574,8 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | `sensor.predbat_evcc_soc` | Vehicle SoC %, kept at its last observed value while disconnected (`stale`, `age_minutes`, `observed` attributes) |
 | `sensor.predbat_evcc_battery_size` | Vehicle usable capacity in kWh |
 | `sensor.predbat_evcc_plan_time` | Next departure time as `HH:MM:SS`, or `off` when no usable plan applies (`plan_source`, `plan_datetime`) |
-| `sensor.predbat_evcc_plan_soc` | The plan's target SoC %, falling back to the standing limit |
-| `sensor.predbat_evcc_limit_soc` | The vehicle's standing SoC limit, used as the solar charging cap |
+| `sensor.predbat_evcc_plan_soc` | The plan's target SoC %, capped by the loadpoint's effective limit and falling back to it when no plan applies (`plan_source`, `plan_soc`, `effective_limit_soc`, `capped`) |
+| `sensor.predbat_evcc_limit_soc` | The loadpoint's effective SoC limit - its session limit, else the vehicle's standing one - used as the solar charging cap |
 | `sensor.predbat_evcc_max_power` / `_min_power` / `_power_step` | Charger power band in kW, derived from amps and phases |
 | `sensor.predbat_evcc_charge_power` | Present charging power in W |
 | `sensor.predbat_evcc_mode` | evcc's current charging mode |
