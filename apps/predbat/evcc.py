@@ -513,6 +513,12 @@ class EvccAPI(ComponentBase):
 
         evcc clears vehicleName on disconnect, so the last seen vehicle is remembered - that is
         what makes the plan readable while the car is away.
+
+        A loadpoint that is connected with no vehicleName is a car evcc could not identify - a guest,
+        or one whose API is down. That must never resolve to the configured vehicle: evcc gives an
+        unidentified car the loadpoint's own default mode rather than the vehicle's, so it charges to
+        somebody else's plan, and planning it as the known car would buy import for a battery Predbat
+        knows nothing about. The single-vehicle shortcut is therefore only safe while disconnected.
         """
         vehicles = self.state.get("vehicles") or {}
         key = loadpoint.get("vehicleName") or None
@@ -520,8 +526,10 @@ class EvccAPI(ComponentBase):
             return key, vehicles[key]
         if key:
             return key, {}
+        if loadpoint.get("connected"):
+            return None, {}
         if len(vehicles) == 1:
-            # A single configured vehicle is unambiguous even when nothing is plugged in
+            # A single configured vehicle is unambiguous while nothing is plugged in
             only_key = list(vehicles.keys())[0]
             return only_key, vehicles[only_key]
         return None, {}
@@ -543,17 +551,21 @@ class EvccAPI(ComponentBase):
             self.sticky_soc[car_n] = value
             self.sticky_soc_time[car_n] = self.now_utc
 
-    def update_sticky_soc(self, car_n, loadpoint, vehicle):
+    def update_sticky_soc(self, car_n, loadpoint, vehicle, known=True):
         """
         Track the vehicle SoC, keeping the last observed value while the car is disconnected.
 
         Returns (soc, stale, age_minutes). evcc only reports the SoC of a connected vehicle, so
         without this the value would drop to zero the moment the car is unplugged.
+
+        An unidentified car contributes nothing: whatever evcc reports for it belongs to somebody
+        else's battery, and letting it land here would overwrite the remembered SoC of the car the
+        plan is actually built around.
         """
         self.restore_sticky(car_n)
 
-        soc = vehicle.get("soc")
-        if not soc and loadpoint.get("connected"):
+        soc = vehicle.get("soc") if known else None
+        if not soc and known and loadpoint.get("connected"):
             soc = loadpoint.get("vehicleSoc")
 
         if soc:
@@ -593,11 +605,19 @@ class EvccAPI(ComponentBase):
         vehicle_key, vehicle = self.vehicle_for(loadpoint)
         connected = bool(loadpoint.get("connected"))
         charging = bool(loadpoint.get("charging"))
+        # Only a car evcc has identified is one Predbat can plan for - see vehicle_for
+        known = connected and bool(vehicle_key)
 
         self.dashboard_item(self.entity("binary_sensor", "connected", car_n), state="on" if connected else "off", attributes={"friendly_name": "Predbat evcc car connected", "icon": "mdi:ev-plug-type2", "loadpoint": loadpoint.get("title")}, app="evcc")
+        self.dashboard_item(
+            self.entity("binary_sensor", "known_car", car_n),
+            state="on" if known else "off",
+            attributes={"friendly_name": "Predbat evcc known car connected", "icon": "mdi:car-key", "vehicle": vehicle_key, "connected": connected},
+            app="evcc",
+        )
         self.dashboard_item(self.entity("binary_sensor", "charging", car_n), state="on" if charging else "off", attributes={"friendly_name": "Predbat evcc car charging", "icon": "mdi:ev-station"}, app="evcc")
 
-        soc, stale, age_minutes = self.update_sticky_soc(car_n, loadpoint, vehicle)
+        soc, stale, age_minutes = self.update_sticky_soc(car_n, loadpoint, vehicle, known=known or not connected)
         self.dashboard_item(
             self.entity("sensor", "soc", car_n),
             state=dp2(soc) if soc is not None else 0,
@@ -677,7 +697,10 @@ class EvccAPI(ComponentBase):
             app="evcc",
         )
         self.dashboard_item(
-            self.entity("sensor", "vehicle", car_n), state=vehicle.get("title") or loadpoint.get("vehicleTitle") or "unknown", attributes={"friendly_name": "Predbat evcc vehicle", "icon": "mdi:car", "key": vehicle_key, "connected": connected}, app="evcc"
+            self.entity("sensor", "vehicle", car_n),
+            state=vehicle.get("title") or loadpoint.get("vehicleTitle") or "unknown",
+            attributes={"friendly_name": "Predbat evcc vehicle", "icon": "mdi:car", "key": vehicle_key, "connected": connected, "known": known},
+            app="evcc",
         )
         self.dashboard_item(self.entity("binary_sensor", "plan_active", car_n), state="on" if loadpoint.get("planActive") else "off", attributes={"friendly_name": "Predbat evcc plan active", "icon": "mdi:calendar-clock"}, app="evcc")
 
@@ -765,8 +788,10 @@ class EvccAPI(ComponentBase):
             """Build the per-car entity list in car order, padding gaps with None."""
             return [self.entity(domain, name, car_n) if car_n in self.loadpoint_map else None for car_n in range(count)]
 
-        self.auto_set("car_charging_planned", per_car("binary_sensor", "connected"))
-        self.auto_set("car_charging_plugged", per_car("binary_sensor", "connected"))
+        # Planned and plugged drive the plan itself, so they follow the identified car rather than the
+        # cable: a guest on the loadpoint is somebody else's charge and must not pull grid slots
+        self.auto_set("car_charging_planned", per_car("binary_sensor", "known_car"))
+        self.auto_set("car_charging_plugged", per_car("binary_sensor", "known_car"))
         self.auto_set("car_charging_soc", per_car("sensor", "soc"))
         self.auto_set("car_charging_battery_size", per_car("sensor", "battery_size"))
         self.auto_set("car_charging_limit", per_car("sensor", "plan_soc"))

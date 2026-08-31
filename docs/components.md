@@ -544,6 +544,13 @@ becomes a 1.38kW minimum, 3.68kW maximum and a 0.23kW step - instead of you work
 - `car_charging_energy` is **not** auto-configured; evcc reports session energy in Wh and the unit is not
   consistent across versions, so wire it yourself if you want it.
 - One loadpoint maps to one Predbat car. Two cars sharing a single loadpoint is not modelled.
+- **Predbat only plans for a car evcc has identified.** A loadpoint that is connected with no
+  `vehicleName` is a guest, or a car whose API is down; evcc gives it the loadpoint's own default
+  mode rather than a vehicle's, so it charges to nobody's plan. Predbat treats it the same way:
+  `car_charging_planned` and `car_charging_plugged` are wired to **binary_sensor.predbat_evcc_known_car**
+  rather than to `connected`, so no grid slots are planned for it and its SoC never overwrites the
+  remembered SoC of your own car. While the loadpoint is empty a single configured vehicle is still
+  resolved, which is what keeps its departure plan readable with the car away.
 
 #### Configuration Options (evcc)
 
@@ -569,7 +576,8 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 
 | Entity | Meaning |
 | ------ | ------- |
-| `binary_sensor.predbat_evcc_connected` | The car is plugged in |
+| `binary_sensor.predbat_evcc_connected` | A car is plugged in, identified or not |
+| `binary_sensor.predbat_evcc_known_car` | A car evcc has **identified** is plugged in - this is what the plan follows |
 | `binary_sensor.predbat_evcc_charging` | The car is drawing power |
 | `sensor.predbat_evcc_soc` | Vehicle SoC %, kept at its last observed value while disconnected (`stale`, `age_minutes`, `observed` attributes) |
 | `sensor.predbat_evcc_battery_size` | Vehicle usable capacity in kWh |

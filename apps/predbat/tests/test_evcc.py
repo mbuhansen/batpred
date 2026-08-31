@@ -940,6 +940,51 @@ def test_effective_limit_caps_plan():
     return failures
 
 
+def test_only_plans_for_a_known_car():
+    """A car evcc cannot identify is somebody else's charge, and is never planned for"""
+    print("**** Running Test: evcc_known_car ****")
+    failures = []
+
+    def publish_with(connected, vehicle_name=""):
+        """Publish one car with the loadpoint in a given connection state."""
+        state = copy.deepcopy(SAMPLE_STATE)
+        state["loadpoints"][0].update(connected=connected, vehicleName=vehicle_name)
+        api = MockEvccAPI(host="http://evcc", automatic=True)
+        api.state = state
+        api.loadpoint_map = {0: 0}
+        api.publish_car(0, state["loadpoints"][0])
+        return api, state
+
+    # Disconnected with one configured vehicle: still resolved, so the departure plan stays readable
+    api, state = publish_with(connected=False)
+    check("away_resolves", api.vehicle_for(state["loadpoints"][0])[0], "db:3", failures)
+    check("away_not_known", api.entities["binary_sensor.predbat_evcc_known_car"]["state"], "off", failures)
+
+    # Connected but unidentified - the single-vehicle shortcut must not claim it
+    api, state = publish_with(connected=True)
+    check("guest_unresolved", api.vehicle_for(state["loadpoints"][0]), (None, {}), failures)
+    check("guest_not_known", api.entities["binary_sensor.predbat_evcc_known_car"]["state"], "off", failures)
+    # The cable is still reported as connected - that is what evcc says, and the mode gate needs it
+    check("guest_connected", api.entities["binary_sensor.predbat_evcc_connected"]["state"], "on", failures)
+    check("guest_vehicle_attr", api.entities["sensor.predbat_evcc_vehicle"]["attributes"]["known"], False, failures)
+
+    # Connected and identified
+    api, state = publish_with(connected=True, vehicle_name="db:3")
+    check("known_resolves", api.vehicle_for(state["loadpoints"][0])[0], "db:3", failures)
+    check("known_on", api.entities["binary_sensor.predbat_evcc_known_car"]["state"], "on", failures)
+
+    # The plan follows the identified car, not the cable
+    api.automatic_config()
+    check("planned_wired", api.args["car_charging_planned"], ["binary_sensor.predbat_evcc_known_car"], failures)
+    check("plugged_wired", api.args["car_charging_plugged"], ["binary_sensor.predbat_evcc_known_car"], failures)
+
+    # A guest's SoC must not overwrite the remembered SoC of the car the plan is built around
+    api = MockEvccAPI(host="http://evcc", soc_max_age_hours=24)
+    check("own_soc", api.update_sticky_soc(0, {"connected": True, "vehicleSoc": 55}, {"soc": 55})[0], 55, failures)
+    check("guest_ignored", api.update_sticky_soc(0, {"connected": True, "vehicleSoc": 9}, {}, known=False)[0], 55, failures)
+    return failures
+
+
 def test_evcc(my_predbat=None):
     """
     Run the evcc component tests, returns True on failure
@@ -964,6 +1009,7 @@ def test_evcc(my_predbat=None):
         test_override_detection,
         test_apply_modes_writes,
         test_only_borrows_a_resting_loadpoint,
+        test_only_plans_for_a_known_car,
         test_client_http,
         test_registry_and_schema,
         test_run_cycle,
