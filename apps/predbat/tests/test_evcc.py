@@ -985,6 +985,55 @@ def test_only_plans_for_a_known_car():
     return failures
 
 
+def test_guest_car_battery_hold():
+    """An unidentified car drawing power holds the home battery, but only when the switch is on"""
+    print("**** Running Test: evcc_guest_hold ****")
+    failures = []
+
+    def publish(connected, charging, vehicle_name=""):
+        """Publish one car in a given state and return the component."""
+        state = copy.deepcopy(SAMPLE_STATE)
+        state["loadpoints"][0].update(connected=connected, charging=charging, vehicleName=vehicle_name)
+        api = MockEvccAPI(host="http://evcc")
+        api.state = state
+        api.loadpoint_map = {0: 0}
+        api.publish_car(0, state["loadpoints"][0])
+        return api
+
+    # A car evcc could not identify, actually drawing power
+    api = publish(connected=True, charging=True)
+    check("guest_on", api.entities["binary_sensor.predbat_evcc_guest_charging"]["state"], "on", failures)
+    # ...but the hold is opt-in, so nothing is asked of Predbat until the switch is turned on
+    check("switch_defaults_off", api.guest_hold(), False, failures)
+    check("base_flag_off", api.base.evcc_guest_charging, False, failures)
+    check("switch_published", api.entities["switch.predbat_evcc_guest_hold"]["state"], "off", failures)
+
+    api.guest_hold_enabled = True
+    check("holds", api.guest_hold(), True, failures)
+    check("base_flag_on", api.base.evcc_guest_charging, True, failures)
+    check("switch_on", api.entities["switch.predbat_evcc_guest_hold"]["state"], "on", failures)
+
+    # Every state that is not a guest drawing power leaves the battery alone
+    for label, connected, charging, vehicle in (("known", True, True, "db:3"), ("guest_idle", True, False, ""), ("empty", False, False, "")):
+        api = publish(connected=connected, charging=charging, vehicle_name=vehicle)
+        api.guest_hold_enabled = True
+        check("no_hold_{}".format(label), api.guest_hold(), False, failures)
+        check("sensor_off_{}".format(label), api.entities["binary_sensor.predbat_evcc_guest_charging"]["state"], "off", failures)
+
+    # The switch survives a restart through the entity it published
+    restarted = MockEvccAPI(host="http://evcc")
+    restarted.loadpoint_map = {0: 0}
+    restarted.entities["switch.predbat_evcc_guest_hold"] = {"state": "on", "attributes": {}}
+    restarted.guest_hold()
+    check("restored", restarted.guest_hold_enabled, True, failures)
+
+    # Turning it off in Home Assistant is applied through the component's own event queue
+    run_async(restarted.switch_event("switch.predbat_evcc_guest_hold", "turn_off"))
+    restarted.handle_switch_event(*restarted.queued_events.pop(0))
+    check("switched_off", restarted.guest_hold_enabled, False, failures)
+    return failures
+
+
 def test_evcc(my_predbat=None):
     """
     Run the evcc component tests, returns True on failure
@@ -1010,6 +1059,7 @@ def test_evcc(my_predbat=None):
         test_apply_modes_writes,
         test_only_borrows_a_resting_loadpoint,
         test_only_plans_for_a_known_car,
+        test_guest_car_battery_hold,
         test_client_http,
         test_registry_and_schema,
         test_run_cycle,

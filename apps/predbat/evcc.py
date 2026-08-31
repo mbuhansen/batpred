@@ -417,6 +417,10 @@ class EvccAPI(ComponentBase):
         self.override_until = {}
         self.last_connected = {}
         self.control_enabled = {}
+        self.guest_charging = {}
+        # Off by default: evcc loses identification of a car from time to time (its API goes down),
+        # and holding the battery on that alone would force expensive import nobody asked for
+        self.guest_hold_enabled = None
 
         # Snapshot apps.yaml before any set_arg, so auto-config can tell a user's own value from
         # one it wrote itself on an earlier cycle
@@ -613,6 +617,16 @@ class EvccAPI(ComponentBase):
             self.entity("binary_sensor", "known_car", car_n),
             state="on" if known else "off",
             attributes={"friendly_name": "Predbat evcc known car connected", "icon": "mdi:car-key", "vehicle": vehicle_key, "connected": connected},
+            app="evcc",
+        )
+        # A car evcc cannot identify, drawing power right now. Nothing in Predbat's plan accounts for
+        # it, so left alone the home battery would quietly cover somebody else's charge
+        guest = connected and charging and not known
+        self.guest_charging[car_n] = guest
+        self.dashboard_item(
+            self.entity("binary_sensor", "guest_charging", car_n),
+            state="on" if guest else "off",
+            attributes={"friendly_name": "Predbat evcc guest car charging", "icon": "mdi:account-question", "vehicle": vehicle_key, "connected": connected},
             app="evcc",
         )
         self.dashboard_item(self.entity("binary_sensor", "charging", car_n), state="on" if charging else "off", attributes={"friendly_name": "Predbat evcc car charging", "icon": "mdi:ev-station"}, app="evcc")
@@ -1054,6 +1068,34 @@ class EvccAPI(ComponentBase):
             if self.control:
                 self.dashboard_item(self.entity("switch", "control", car_n), state="on" if self.control_enabled.get(car_n, True) else "off", attributes={"friendly_name": "Predbat evcc control enabled", "icon": "mdi:robot"}, app="evcc")
 
+    def guest_hold(self):
+        """
+        Publish the guest-hold switch and tell Predbat whether the battery must be held right now.
+
+        The switch is the component's own, like switch.predbat_evcc_control, and is seeded from the
+        entity it published last time so a restart does not silently turn the user's choice back off -
+        the same reason restore_sticky and restore_saved_mode read their own sensors back.
+
+        Predbat gets one boolean rather than the switch and the state separately, because the decision
+        is the component's: only it knows which car on which loadpoint evcc failed to identify.
+        """
+        if self.guest_hold_enabled is None:
+            state = self.get_state_wrapper(entity_id=self.entity("switch", "guest_hold", 0))
+            self.guest_hold_enabled = str(state).lower() == "on"
+
+        holding = self.guest_hold_enabled and any(self.guest_charging.get(car_n, False) for car_n in self.loadpoint_map)
+        if holding != bool(getattr(self.base, "evcc_guest_charging", False)):
+            self.log("EvccAPI: home battery hold for an unidentified car {}".format("on" if holding else "off"))
+        self.base.evcc_guest_charging = holding
+
+        self.dashboard_item(
+            self.entity("switch", "guest_hold", 0),
+            state="on" if self.guest_hold_enabled else "off",
+            attributes={"friendly_name": "Predbat evcc hold battery for a guest car", "icon": "mdi:home-battery-outline", "holding": holding},
+            app="evcc",
+        )
+        return holding
+
     # ------------------------------------------------------------------ events
 
     async def switch_event(self, entity_id, service):
@@ -1061,7 +1103,11 @@ class EvccAPI(ComponentBase):
         self.queued_events.append((entity_id, service))
 
     def handle_switch_event(self, entity_id, service):
-        """Apply a queued switch change to the per-car control kill switch."""
+        """Apply a queued switch change to the control kill switch or the guest battery hold."""
+        if entity_id == self.entity("switch", "guest_hold", 0):
+            self.guest_hold_enabled = service == "turn_on"
+            self.log("EvccAPI: guest car battery hold switched {}".format("on" if self.guest_hold_enabled else "off"))
+            self.force_refresh = True
         for car_n in self.loadpoint_map:
             if entity_id == self.entity("switch", "control", car_n):
                 self.control_enabled[car_n] = service == "turn_on"
@@ -1118,6 +1164,7 @@ class EvccAPI(ComponentBase):
                     self.log("Warn: EvccAPI: failed to publish car {}: {}".format(car_n, error))
 
         self.publish_priority_soc()
+        self.guest_hold()
 
         signature = self.signature(loadpoints)
         if self.automatic and signature != self.config_signature:

@@ -578,6 +578,7 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | ------ | ------- |
 | `binary_sensor.predbat_evcc_connected` | A car is plugged in, identified or not |
 | `binary_sensor.predbat_evcc_known_car` | A car evcc has **identified** is plugged in - this is what the plan follows |
+| `binary_sensor.predbat_evcc_guest_charging` | A car evcc could **not** identify is drawing power right now |
 | `binary_sensor.predbat_evcc_charging` | The car is drawing power |
 | `sensor.predbat_evcc_soc` | Vehicle SoC %, kept at its last observed value while disconnected (`stale`, `age_minutes`, `observed` attributes) |
 | `sensor.predbat_evcc_battery_size` | Vehicle usable capacity in kWh |
@@ -591,6 +592,7 @@ Per car, with `_1`, `_2` … postfixes for later cars:
 | `sensor.predbat_evcc_restore_mode` | The mode owed back to evcc during a takeover, or `none` |
 | `binary_sensor.predbat_evcc_override` | On when somebody changed the mode in evcc and Predbat has backed off |
 | `switch.predbat_evcc_control` | Runtime kill switch for mode writing (only when `evcc_control` is set) |
+| `switch.predbat_evcc_guest_hold` | Hold the home battery while an unidentified car charges. Off by default |
 | `sensor.predbat_evcc_priority_soc` | The site's home battery priority SoC. With `evcc_automatic` it also sets **input_number.predbat_car_charging_solar_min_soc**, but only when the value in evcc changes, so your own adjustments are not undone every poll |
 | `sensor.predbat_evcc_status` | `ok` / `degraded` / `unreachable`, with the evcc version and any missing fields |
 
@@ -631,6 +633,24 @@ switch is on; every refusal is published as the `reason` attribute on `sensor.pr
 "why is nothing happening" is answerable from that entity alone. If you change the mode in evcc's own UI
 during a takeover, Predbat backs off for `evcc_override_minutes` and abandons the hand-back - the mode you
 chose is now the one that stands, and the next takeover starts from it.
+
+#### Guest cars (evcc)
+
+A car evcc cannot identify is not in Predbat's plan, but it is still real load, and the home battery
+would quietly cover it. **switch.predbat_evcc_guest_hold** stops that: while
+`binary_sensor.predbat_evcc_guest_charging` is on, Predbat holds the battery the same way it does
+during a planned car slot - pausing discharge, or dropping the discharge rate and lifting the reserve -
+so the guest's charge is bought from the grid. The plan status shows `Hold for car`.
+
+It is **off by default**, and deliberately so: evcc loses identification of a car from time to time
+(its API goes down), and a hold that fired on that alone would force expensive import nobody asked
+for. It is also independent of **switch.predbat_car_charging_from_battery**, which is about your own
+planned car - you can let your own car use the battery while a guest may not.
+
+Two things it does not do. It does not stop the guest charging: that is evcc's decision, and the
+loadpoint's own default mode already covers it (Predbat never takes a loadpoint out of `off` - see
+above). And Predbat's forecast still sees the guest's consumption as house load, so it lands in the
+load history like any other unexpected demand.
 
 #### Example configuration (evcc)
 
