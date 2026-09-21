@@ -21,7 +21,7 @@ requirements and costs for heat pump systems.
 
 from datetime import datetime, timedelta
 import pytz
-from utils import str2time, dp2, dp3, minute_data
+from utils import str2time, dp2, dp3, minute_data, minutes_since_midnight
 
 from const import TIME_FORMAT
 
@@ -177,6 +177,7 @@ class PredHeat:
         self.had_errors = False
         self.prediction_started = False
         self.update_pending = False
+        self.enabled_logged = None
         self.prefix = self.get_arg("prefix", "predheat", domain="predheat")
         self.days_previous = [7]
         self.days_previous_weight = [1]
@@ -410,7 +411,6 @@ class PredHeat:
                     heat_power_in = heat_power_out / (self.heat_cop * cop_adjust)
 
                 energy_now_in = heat_power_in * PREDICT_STEP / 60.0 / 1000.0
-                energy_now_out = heat_power_out * PREDICT_STEP / 60.0 / 1000.0
 
                 cost += energy_now_in * self.rate_import.get(minute_absolute, 0)
                 heat_energy += energy_now_in
@@ -529,12 +529,12 @@ class PredHeat:
 
         local_tz = pytz.timezone(self.get_arg("timezone", "Europe/London"))
         now_utc = datetime.now(local_tz)
-        now = datetime.now()
         self.forecast_days = self.get_arg("forecast_days", 2, domain="predheat")
         self.forecast_minutes = self.forecast_days * 60 * 24
-        self.midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
         self.midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        self.minutes_now = int((now - self.midnight).seconds / 60 / PREDICT_STEP) * PREDICT_STEP
+        # Measured against now_utc like the rest of Predbat, rather than a second naive clock
+        # taken from the host's timezone - see update_time() in predbat.py, which shares this helper.
+        self.minutes_now = minutes_since_midnight(now_utc, self.midnight_utc)
         self.metric_future_rate_offset_import = 0
 
         self.log("Predheat: update at {}".format(now_utc))
@@ -633,11 +633,34 @@ class PredHeat:
         self.run_every(self.run_time_loop, next_time, run_every, random_start=0, random_end=0)
         self.run_every(self.update_time_loop, datetime.now(), 5, random_start=0, random_end=0)
 
+    def is_enabled(self):
+        """
+        Report whether Predheat is turned on, logging each change of state
+
+        Both timer callbacks below simply return when Predheat is off, so without this a
+        disabled Predheat logs its startup banner and then goes completely silent forever -
+        indistinguishable in the log from a scheduler that never fires (#4670). Log the state
+        once per transition so the log always says which of the two is happening.
+        """
+        enabled = True if self.get_arg("predheat_enable") else False
+
+        if enabled != self.enabled_logged:
+            if enabled:
+                self.log("Predheat: Enabled via switch.{}_predheat_enable, will update every {} minutes".format(self.base.prefix, self.get_arg("run_every", 5, domain="predheat")))
+                # Coming back from disabled the scheduled run can be up to run_every away, so ask
+                # for an immediate one - otherwise turning the switch on looks like it did nothing.
+                self.update_pending = True
+            else:
+                self.log("Predheat: Disabled - turn on switch.{}_predheat_enable to run it".format(self.base.prefix))
+            self.enabled_logged = enabled
+
+        return enabled
+
     def update_time_loop(self, cb_args):
         """
         Called every 15 seconds
         """
-        if not self.get_arg("predheat_enable"):
+        if not self.is_enabled():
             return
 
         if self.update_pending and not self.prediction_started:
@@ -657,7 +680,7 @@ class PredHeat:
         """
         Called every N minutes
         """
-        if not self.get_arg("predheat_enable"):
+        if not self.is_enabled():
             return
 
         if not self.prediction_started:

@@ -31,7 +31,10 @@ from const import (
     PREDBAT_MODE_MONITOR,
     LOAD_FORECAST_HISTORY_MAX_DAYS,
     PREDBAT_MAX_CARS,
-    LOW_POWER_PV_LIGHT_FRACTION,
+    CAR_CHARGING_LIMIT_UNCAPPED,
+    CLOUD_WINDOW_MINUTES,
+    CLOUD_ARRAY_MARGIN,
+    PV_ARRAY_KWP_UNKNOWN,
     CAR_SOLAR_EXPORT_ALWAYS,
     CAR_PLUGGED_RESPONSE,
     CAR_UNPLUGGED_RESPONSE,
@@ -76,6 +79,79 @@ class Fetch:
         else:
             return None
 
+    def get_cloud_duty(self, minutes_now, pv_data, pv_data10, pv_data90):
+        """Work out how many steps of each conservation window the envelope model spends raised.
+
+        Peaks reach the p90 ceiling and troughs reach the p10 floor together only when the up:down
+        step ratio matches the band's own asymmetry, (p50-p10):(p90-p50). Solcast's downside is
+        typically about twice its upside, so a fixed 1:1 alternation - all the pairwise model could
+        express - always under-reaches on one side.
+
+        Returns (n_up, n_down), or None when there is no upside band to reach for: a forecast source
+        that publishes no p90 falls back to a copy of the p50, and the caller must keep the legacy
+        proportional model rather than silently losing the cloud model altogether.
+        """
+        up_gap = 0.0
+        down_gap = 0.0
+        for minute in range(self.forecast_minutes):
+            nominal = pv_data.get(minute + minutes_now, 0.0)
+            up_gap += max(pv_data90.get(minute + minutes_now, 0.0) - nominal, 0.0)
+            down_gap += max(nominal - pv_data10.get(minute + minutes_now, 0.0), 0.0)
+
+        if up_gap <= 0:
+            return None
+
+        period = CLOUD_WINDOW_MINUTES // PREDICT_STEP
+        ratio = down_gap / up_gap
+        # Clamped to leave at least one step on each side - a window that is all up or all down has
+        # nothing to trade against and would leave the borrow outstanding.
+        n_up = int(min(max(round(period * ratio / (1.0 + ratio)), 1), period - 1))
+        return (n_up, period - n_up)
+
+    def resolve_pv_array_kwp(self, detected_kwp):
+        """Settle the DC array size the p90 cloud ceiling is capped against.
+
+        Forecast Solar and Open-Meteo declare kwp per array and fetch_pv_forecast already totals it,
+        so most setups need no configuration. Solcast and the HA integrations publish no array size
+        and arrive as the PV_ARRAY_KWP_UNKNOWN sentinel, leaving the cap inert - correct, since an
+        invented figure would be worse than none. apps.yaml wins over both: declared figures are
+        routinely understated, users entering the inverter rating or one string of two.
+        """
+        configured = self.get_arg("pv_array_kwp", 0.0)
+        if configured and configured > 0:
+            self.pv_array_kwp = float(configured)
+        elif detected_kwp and 0 < detected_kwp < PV_ARRAY_KWP_UNKNOWN:
+            self.pv_array_kwp = float(detected_kwp)
+        else:
+            self.pv_array_kwp = 0.0
+        return self.pv_array_kwp
+
+    def get_pv90_cloud_ceiling(self, minutes_now, pv_data, pv_data90):
+        """Build the per-minute ceiling the p90 series modulates toward.
+
+        p50 reaches for p90 and p10 reaches for p50, but p90 has no next percentile above it, so its
+        upside is extrapolated by continuing the band one width further. Leaving p90 unmodulated
+        instead is not neutral: it makes p90 the one smooth scenario, handing it an efficiency
+        bonus the other two do not get and biasing every comparison between them.
+
+        The extrapolation is capped at the DC array size times CLOUD_ARRAY_MARGIN, since a very wide
+        band can otherwise reach past anything the array could physically produce. The cap can never
+        pull the ceiling below p90 itself - that would invert the upside scenario into a downside
+        one, which is the same failure mode load_scaling90 is clamped against.
+        """
+        array_kwp = getattr(self, "pv_array_kwp", 0) or 0
+        cap = (array_kwp * CLOUD_ARRAY_MARGIN / 60.0) if array_kwp > 0 else None
+
+        ceiling = {}
+        for minute in range(self.forecast_minutes):
+            minute_absolute = minute + minutes_now
+            upside = pv_data90.get(minute_absolute, 0.0)
+            extended = upside + max(upside - pv_data.get(minute_absolute, 0.0), 0.0)
+            if cap is not None:
+                extended = max(min(extended, cap), upside)
+            ceiling[minute_absolute] = extended
+        return ceiling
+
     def filtered_today(self, time_data, resetmidnight=False, stamp=None):
         """
         Grab figure for today (midnight)
@@ -107,6 +183,33 @@ class Fetch:
             id += 1
         return new_data
 
+    def inday_yesterday_weight(self, minutes_now):
+        """
+        Weight the previous day's in-day load adjustment carries at a point in the day: full weight for the
+        first three hours (too little of today has happened to measure a divergence), then decaying linearly
+        to zero by midnight as today's own measurement takes over.
+        """
+        if minutes_now < 180:
+            return 1.0
+        return (24 * 60 - minutes_now) / (24 * 60)
+
+    def inday_adjustment_at(self, minute_absolute, scale_today):
+        """
+        In-day load adjustment factor to apply at a given minute from midnight today.
+
+        Today keeps the factor in full. Tomorrow it decays on exactly the curve load_today_comparison() will
+        use when it seeds tomorrow's factor from today's final value, so the plan agrees with what Predbat
+        will actually apply a few hours later - resetting to 1.0 at midnight instead left tonight's overnight
+        charge sized against a forecast Predbat was about to correct (batpred#4732). Beyond tomorrow there is
+        no measurement left to carry and the factor is neutral.
+        """
+        day_offset = minute_absolute // (24 * 60)
+        if day_offset <= 0:
+            return scale_today
+        if day_offset > 1:
+            return 1.0
+        return 1.0 + (scale_today - 1.0) * self.inday_yesterday_weight(minute_absolute % (24 * 60))
+
     def step_data_history(
         self,
         item,
@@ -116,17 +219,25 @@ class Fetch:
         scale_today=1.0,
         scale_fixed=1.0,
         type_load=False,
-        load_forecast={},
+        load_forecast=None,
         cloud_factor=None,
+        cloud_ceiling=None,
+        cloud_duty=None,
         load_scaling_dynamic=None,
         base_offset=None,
         flip=False,
-        load_adjust={},
-        load_baseline={},
+        load_adjust=None,
+        load_baseline=None,
     ):
         """
         Create cached step data for historical array
         """
+        if load_baseline is None:
+            load_baseline = {}
+        if load_adjust is None:
+            load_adjust = {}
+        if load_forecast is None:
+            load_forecast = {}
         values = {}
         cloud_diff = 0
 
@@ -138,9 +249,9 @@ class Fetch:
             if load_scaling_dynamic:
                 scaling_dynamic = load_scaling_dynamic.get(minute_absolute, scaling_dynamic)
 
-            # Reset in-day adjustment for tomorrow
-            if (minute + minutes_now) > 24 * 60:
-                scale_today = 1.0
+            # Carry the in-day adjustment over midnight on the decay curve load_today_comparison() will
+            # apply tomorrow, rather than resetting it to 1.0 (batpred#4732)
+            scale_slot = self.inday_adjustment_at(minute_absolute, scale_today)
 
             if type_load and not forward:
                 if self.load_forecast_only:
@@ -161,26 +272,100 @@ class Fetch:
             # Extra load adding in (e.g. heat pump)
             load_extra = 0
             if load_forecast:
-                for offset in range(step):
+                for _offset in range(step):
                     load_extra += self.get_from_incrementing(load_forecast, minute_absolute, backwards=False)
             if load_adjust:
                 load_extra += load_adjust.get(minute_absolute, 0) * step / float(self.plan_interval_minutes)  # The kWh figure is for the plan interval period, so divide by plan_interval_minutes and times by step
             load_extra = max(load_extra, -value)  # Don't allow going to negative load values
-            values[minute] = dp4((value + load_extra) * scaling_dynamic * scale_today * scale_fixed)
+            values[minute] = dp4((value + load_extra) * scaling_dynamic * scale_slot * scale_fixed)
 
             # Apply dynamic baseline
             if minute_absolute in load_baseline:
                 values[minute] = max(values[minute], load_baseline[minute_absolute])
 
-        # Simple divergence model keeps the same total but brings PV/Load up and down every 5 minutes
+        # Envelope-driven divergence model. Where the legacy model below swings by a fraction of
+        # the local value, this one swings toward a real per-minute ceiling - the next forecast
+        # percentile up - so the amplitude follows what the forecaster actually said about
+        # uncertainty at that time of day rather than one horizon-wide scalar.
+        #
+        # Conservation is per CLOUD_WINDOW_MINUTES rather than per adjacent pair. That is the whole
+        # point of the window: a pair can only trade 1:1, so a trough can never fall further than
+        # the peak beside it rose, and with an asymmetric p10/p50/p90 band the peak is the narrow
+        # side. Six steps to a window allow an uneven duty cycle (n_up up, n_down down), which lets
+        # peaks reach the ceiling while troughs still fall far enough to change the plan.
+        if cloud_ceiling and cloud_duty:
+            n_up, n_down = cloud_duty
+            period = n_up + n_down
+            # flip offsets the pattern by n_up so a flipped series lowers exactly where the plain
+            # one raises - the antiphase the legacy model got from a 1:1 alternation, generalised
+            # to an uneven duty cycle.
+            phase = n_up if flip else 0
+            for window_start in range(0, self.forecast_minutes, CLOUD_WINDOW_MINUTES):
+                offsets = [minute for minute in range(window_start, min(window_start + CLOUD_WINDOW_MINUTES, self.forecast_minutes), step)]
+                ups = [minute for minute in offsets if (((minute + minutes_now) // step) + phase) % period < n_up]
+                downs = [minute for minute in offsets if minute not in ups]
+                if not ups or not downs:
+                    continue
+                window_total = sum(values[minute] for minute in offsets)
+                headroom = {minute: max(sum(cloud_ceiling.get(minute + minutes_now + offset, 0.0) for offset in range(step)) - values[minute], 0.0) for minute in ups}
+                want = sum(headroom.values())
+                # Each down step can give back at most what it holds, so the window can never be
+                # driven negative and never has to leave a borrow outstanding.
+                room = sum(max(values[minute] - (load_baseline.get(minute + minutes_now, 0.0) if load_baseline else 0.0), 0.0) for minute in downs)
+                borrow = min(want, room)
+                if borrow <= 0:
+                    continue
+                for minute in ups:
+                    values[minute] = dp4(values[minute] + headroom[minute] * borrow / want)
+                for minute in downs:
+                    floor = load_baseline.get(minute + minutes_now, 0.0) if load_baseline else 0.0
+                    values[minute] = dp4(values[minute] - borrow * max(values[minute] - floor, 0.0) / room)
+                # dp4 on each step leaves up to half a milliwatt-hour per step unaccounted for.
+                # Push that residual onto the roomiest down step, which recovers the window total on
+                # any window holding meaningful energy - the scenarios are compared against each
+                # other, so a systematic drift in one of them is a bias in the plan, not a rounding
+                # detail. It is not guaranteed: the correction is floored at zero, so a window whose
+                # roomiest down step holds less than the residual keeps the remainder. In practice
+                # that is confined to near-empty dawn and dusk windows and measures around 0.001 kWh
+                # over a 48 hour horizon.
+                drift = sum(values[minute] for minute in offsets) - window_total
+                if drift:
+                    roomiest = max(downs, key=lambda minute: values[minute])
+                    values[roomiest] = dp4(max(values[roomiest] - drift, 0.0))
+
+        # Simple divergence model that raises and lowers alternate steps so the planner stops
+        # assuming PV exactly blankets load. It is approximately - not exactly - total-preserving:
+        # a raised step borrows, and the following step repays only what its own value can cover
+        # (`min(cloud_diff, values[minute])`), so a borrow larger than the step that follows it is
+        # not fully given back. Repaying exactly needs the outstanding debt tracked separately from
+        # the next borrow, which is a rewrite of the model rather than a tweak here.
         if cloud_factor and cloud_factor > 0:
+            last_minute = self.forecast_minutes - step
             for minute in range(0, self.forecast_minutes, step):
-                cloud_on = (int((minute + self.minutes_now) / 5) + 1 if flip else 0) % 2
+                # The inner parentheses matter: a conditional expression binds looser than "+", so
+                # "int(...) + 1 if flip else 0" is "(int(...) + 1) if flip else 0" - which is a
+                # constant 0 whenever flip is False, leaving every non-flipped caller unmodulated.
+                # flip only means anything as an antiphase to a modulated base, so it is the offset
+                # that is conditional, not the whole expression.
+                #
+                # Keyed off the minutes_now parameter, not self.minutes_now: every other minute in
+                # this function comes from the parameter, and output.py already calls it with 0.
+                # That also keeps the result a pure function of the inputs, which the replay and
+                # test paths rely on for determinism.
+                cloud_on = (int((minute + minutes_now) / step) + (1 if flip else 0)) % 2
                 if cloud_on > 0:
-                    cloud_diff += min(values[minute] * cloud_factor, values.get(minute + 5, 0) * cloud_factor)
-                    values[minute] += cloud_diff
+                    # Don't borrow on the final step - the fill loop above runs a plan interval
+                    # past forecast_minutes, so values.get(minute + step) finds a real bucket that
+                    # this loop will never reach to repay, leaking that borrow into the total.
+                    if minute < last_minute:
+                        cloud_diff += min(values[minute] * cloud_factor, values.get(minute + step, 0) * cloud_factor)
+                        values[minute] += cloud_diff
                 else:
-                    subtract = min(cloud_diff, values[minute])
+                    # The dynamic load baseline is a floor, applied in the fill loop above. The
+                    # subtract has to respect it or the modulation walks straight back through it -
+                    # only ever an issue since the load arrays started being modulated at all.
+                    floor = load_baseline.get(minute + minutes_now, 0.0) if load_baseline else 0.0
+                    subtract = min(cloud_diff, max(values[minute] - floor, 0.0))
                     values[minute] -= subtract
                     cloud_diff = 0
                 values[minute] = dp4(values[minute])
@@ -330,11 +515,11 @@ class Fetch:
         if zero_periods:
             self.log("Warn: Found {} periods of zero load with power data, filling using power integration".format(len(zero_periods)))
             # Print the first 5 periods for debugging
-            for i, (period_start, period_end, base_value) in enumerate(zero_periods[:5]):
+            for _i, (period_start, period_end, base_value) in enumerate(zero_periods[:5]):
                 start_timestamp = self.now_utc - timedelta(minutes=period_start)
                 self.log("Zero load period starting at {} ({} minutes) for {} minutes with base value {}".format(start_timestamp.strftime(TIME_FORMAT), period_start, period_end - period_start + 1, base_value))
 
-            for period_start, period_end, base_value in zero_periods:
+            for period_start, period_end, _base_value in zero_periods:
                 # Integrate power data over this period
                 # First calculate total energy consumed in this period
                 total_energy = 0
@@ -488,7 +673,7 @@ class Fetch:
         if num_gaps > 0:
             self.log("Warn: Found {} gaps in load_today totalling {} minutes to fill using average data".format(len(gap_list), num_gaps))
             # Print the first 5 gaps for debugging
-            for i, (gap_start, gap_length) in enumerate(gap_list[:5]):
+            for _i, (gap_start, gap_length) in enumerate(gap_list[:5]):
                 gap_start_timestamp = self.now_utc - timedelta(minutes=gap_start)
                 self.log("Gap starting at {} ({} minutes) for {} minutes".format(gap_start_timestamp.strftime(TIME_FORMAT), gap_start, gap_length))
 
@@ -722,6 +907,64 @@ class Fetch:
             load_minutes = MinuteArray(load_minutes, size)
         return load_minutes, age_days
 
+    def fetch_pv_forecast_and_dawn(self):
+        """
+        Fetch the PV forecast, compute the dawn light/dark split from it, and publish the dawn
+        binary_sensor - as one call so the ordering that #4699 regressed on (the split must be
+        computed from a freshly-fetched forecast, not the empty dict fetch_sensor_data() resets it
+        to at the top of each cycle) can't drift apart again. Published unconditionally regardless
+        of whether import rates currently exist, so the sensor never goes stale.
+
+        Returns:
+            pv_light_dark: dict as returned by calc_pv_light_dark(), also stored on self.pv_light_dark.
+        """
+        self.pv_forecast_minute, self.pv_forecast_minute10, self.pv_forecast_minute90 = self.fetch_pv_forecast()
+
+        # Stored on self, not just local, so it can be used elsewhere rather than only by the
+        # window split below.
+        pv_light_dark = self.pv_light_dark = self.calc_pv_light_dark()
+        # "on" past dawn, "off" before it or when unclassified (no PV forecast) - based on the PV
+        # forecast crossing low_power_pv_threshold_w, not the same as PV actually producing right
+        # now, see calc_dawn's docstring. Independent of combine_charge_slots/set_charge_low_power.
+        self.dashboard_item(
+            "binary_sensor." + self.prefix + "_dawn",
+            state="on" if pv_light_dark.get(self.minutes_now) == 1 else "off",
+            attributes={"friendly_name": "Predbat is past dawn (light, not dark, by PV forecast)", "icon": "mdi:weather-sunset-up"},
+        )
+        return pv_light_dark
+
+    def combine_active_keep(self):
+        """
+        Combine the SOC keep floors (alerts, manual_soc) and ceilings (manual_soc_max) into all_active_keep/all_active_keep_max.
+        """
+        # Combine keep from alerts and manual SOC into all_active_keep
+        self.all_active_keep = self.alert_active_keep.copy()
+        if self.manual_soc_keep:
+            for minute, soc_value in self.manual_soc_keep.items():
+                if minute in self.all_active_keep:
+                    self.all_active_keep[minute] = max(self.all_active_keep[minute], soc_value)
+                else:
+                    self.all_active_keep[minute] = soc_value
+
+        # Manual SOC max is a ceiling rather than a floor - combine separately, taking the
+        # tightest (lowest) ceiling if more than one source ever applies to the same minute.
+        self.all_active_keep_max = {}
+        if self.manual_soc_max_keep:
+            for minute, soc_value in self.manual_soc_max_keep.items():
+                if minute in self.all_active_keep_max:
+                    self.all_active_keep_max[minute] = min(self.all_active_keep_max[minute], soc_value)
+                else:
+                    self.all_active_keep_max[minute] = soc_value
+
+        # A ceiling below the floor at the same minute is a contradiction (e.g. a leftover manual_soc
+        # override never cleared) - the floor wins as the safety-relevant constraint, so drop the
+        # conflicting ceiling rather than hand the optimiser two penalties pulling opposite ways.
+        for minute in list(self.all_active_keep_max.keys()):
+            floor_value = self.all_active_keep.get(minute, 0)
+            if floor_value > self.all_active_keep_max[minute]:
+                self.log("Warn: manual_soc_max target {}% at minute {} is below the manual_soc/alert floor {}% for the same minute - ignoring the ceiling there".format(self.all_active_keep_max[minute], minute, floor_value))
+                del self.all_active_keep_max[minute]
+
     def fetch_sensor_data(self, save=True):
         """
         Fetch all the data, e.g. energy rates, load, PV predictions, car plan etc.
@@ -755,6 +998,7 @@ class Fetch:
         self.pv_forecast_minute = {}
         self.pv_forecast_minute10 = {}
         self.pv_forecast_minute90 = {}
+        self.pv_light_dark = {}
         # See Plan.refresh_pv_forecast_minute90(): both series are re-fetched together below, so no
         # earlier pair of signatures may be held against them
         self.pv_forecast_minute90_signatures = None
@@ -769,14 +1013,8 @@ class Fetch:
             if alert_feed:
                 self.alerts, self.alert_active_keep = alert_feed.process_alerts(self.minutes_now, self.midnight_utc)
 
-        # Combine keep from alerts and manual SOC into all_active_keep
-        self.all_active_keep = self.alert_active_keep.copy()
-        if self.manual_soc_keep:
-            for minute, soc_value in self.manual_soc_keep.items():
-                if minute in self.all_active_keep:
-                    self.all_active_keep[minute] = max(self.all_active_keep[minute], soc_value)
-                else:
-                    self.all_active_keep[minute] = soc_value
+        # Combine keep floors and ceilings from alerts and manual SOC
+        self.combine_active_keep()
 
         # iBoost load data
         if "iboost_energy_today" in self.args:
@@ -947,7 +1185,8 @@ class Fetch:
             )
 
         # Fetch sensor data for cars, e.g. car plan, car energy, car sessions etc.
-        self.fetch_sensor_data_cars()
+        self.dispatch_timeline_pending = []
+        self.fetch_sensor_data_cars(save=save)
 
         if "rates_export_octopus_url" in self.args:
             # Fixed URL for rate export
@@ -1042,6 +1281,12 @@ class Fetch:
         if self.rate_import or self.rate_export:
             self.set_rate_thresholds()
 
+        # Needed here, ahead of "Find charging windows" below, because calc_pv_light_dark() reads
+        # self.pv_forecast_minute to locate dawn - it was previously fetched further down in this
+        # function, after the dawn calculation had already run against the freshly-reset empty dict
+        # from the top of fetch_sensor_data(), so the dawn split could never actually trigger (#4699).
+        pv_light_dark = self.fetch_pv_forecast_and_dawn()
+
         # Find discharging windows
         if self.rate_export:
             self.high_export_rates, lowest, highest = self.rate_scan_window(self.rate_export, 5, self.rate_export_cost_threshold, True, alt_rates=self.rate_import)
@@ -1052,14 +1297,19 @@ class Fetch:
 
         # Find charging windows
         if self.rate_import:
-            pv_light_dark = self.calc_pv_light_dark()
-
             # Find charging window
             self.low_rates, lowest, highest = self.rate_scan_window(self.rate_import, 5, self.rate_import_cost_threshold, False, alt_rates=self.rate_export, pv_light_dark=pv_light_dark)
             self.log("Low Import rate found rates in range {}{} to {}{}".format(lowest, curr, highest, curr))
             # Update threshold automatically
             if self.rate_low_threshold == 0 and highest >= self.rate_min:
                 self.rate_import_cost_threshold = highest
+
+        # #4516 Stage 1: render the dispatch timelines captured during the car fetch. This has to
+        # come after the low-rate scan above, not merely after set_rate_thresholds(): in automatic
+        # mode (rate_low_threshold 0) set_rate_thresholds() only sets a provisional
+        # "everything but the most expensive" threshold, which the scan then replaces with the real
+        # low-rate band. Rendering on the provisional value painted most of the day as cheap.
+        self.log_dispatch_timelines()
 
         # Work out car plan?
         self.fetch_sensor_data_car_planning()
@@ -1090,9 +1340,6 @@ class Fetch:
         if self.import_today:
             self.cost_today_sofar, self.carbon_today_sofar = self.today_cost(self.import_today, self.export_today, self.car_charging_energy, self.load_minutes, save=save)
 
-        # Fetch PV forecast if enabled, today must be enabled, other days are optional
-        self.pv_forecast_minute, self.pv_forecast_minute10, self.pv_forecast_minute90 = self.fetch_pv_forecast()
-
         if self.load_minutes and not self.load_forecast_only and not self.load_forecast_history:
             # Apply modal filter to historical data. Skipped for days_previous_auto: the weighted-bucket
             # forecast deliberately ignores missing-data buckets, so the gap-filling/padding the modal filter
@@ -1110,6 +1357,12 @@ class Fetch:
                     self.load_forecast[minute] = self.load_forecast.get(minute, 0) + value
                 self.load_forecast_array.append(hist_forecast)
                 self.log("Using weighted-bucket historical load forecast over {} days".format(min(self.load_minutes_age, self.max_days_previous - 1)))
+
+        # Where Load ML genuinely supplied this cycle's forecast, backfill the elapsed part of today
+        # with its own past predictions (the weighted-bucket forecast above is skipped in that case).
+        # load_ml_forecast is this cycle's own fetch result from earlier in this function, so there is
+        # no cross-cycle state that could leave a stale "ML was active" reading behind (#4762 review).
+        self.apply_load_ml_forecast_history(self.now_utc, load_ml_forecast)
 
         # Load today vs actual
         if self.load_minutes:
@@ -1241,9 +1494,12 @@ class Fetch:
                 self.log("Car {} charging is exclusive, will not plan other cars".format(car_n))
                 break
 
-    def fetch_sensor_data_cars(self):
+    def fetch_sensor_data_cars(self, save=True):
         """
         Fetch car specific data such as Octopus intelligent slots and vehicle data if we can get it, and calculate current SoC and limits based on that
+
+        `save` is False when compare.py re-runs the fetch for a candidate tariff rather than the
+        live plan; diagnostics that record state across cycles must be skipped in that case.
         """
 
         # Work out current car SoC and limit
@@ -1271,6 +1527,10 @@ class Fetch:
         else:
             entity_id_list = []
 
+        # Cars whose charging plan came from Octopus Intelligent dispatch slots this cycle - used
+        # below to decide which cars get a model-facing charge limit override (#4967)
+        iog_slot_cars = []
+
         if entity_id_list:
             # Process each car's intelligent slot configuration
             for car_n in range(min(len(entity_id_list), self.num_cars)):
@@ -1280,6 +1540,7 @@ class Fetch:
 
                 completed = []
                 planned = []
+                started = []
 
                 if entity_id and "octopus_intelligent_slot_action_config" in self.args:
                     config_entry = self.get_arg("octopus_intelligent_slot_action_config", None, indirect=False)
@@ -1293,6 +1554,11 @@ class Fetch:
                     try:
                         completed = self.get_state_wrapper(entity_id=entity_id, attribute="completed_dispatches") or self.get_state_wrapper(entity_id=entity_id, attribute="completedDispatches")
                         planned = self.get_state_wrapper(entity_id=entity_id, attribute="planned_dispatches") or self.get_state_wrapper(entity_id=entity_id, attribute="plannedDispatches")
+                        # Not merged into octopus_slots or used for any rate/plan decision yet - read
+                        # only for the #4516 Stage 1 diagnostic timeline log below, to observe whether
+                        # this is a trustworthy earlier-than-completed confirmation signal before
+                        # building any gating logic on it (Stage 2, deferred).
+                        started = self.get_state_wrapper(entity_id=entity_id, attribute="started_dispatches") or self.get_state_wrapper(entity_id=entity_id, attribute="startedDispatches")
                     except (ValueError, TypeError):
                         self.log("Warn: Unable to get data from {} for car {} - octopus_intelligent_slot may not be set correctly in apps.yaml".format(entity_id, car_n))
                         self.record_status(message="Error: octopus_intelligent_slot not set correctly in apps.yaml for car {}".format(car_n), had_errors=True)
@@ -1328,6 +1594,31 @@ class Fetch:
                 # Get car charging limit again from car based on new battery size
                 self.car_charging_limit[car_n] = dp3((float(self.get_arg("car_charging_limit", 100.0, index=car_n)) * self.car_charging_battery_size[car_n]) / 100.0)
 
+                # #4516 Stage 1: diagnostic dispatch-timeline log. Purely observational - see
+                # build_dispatch_timeline()'s and dispatch_timeline_should_log()'s docstrings.
+                # Only the live plan's view is worth recording: compare.py re-runs this whole
+                # fetch per candidate tariff (with save=False), which otherwise emits a burst of
+                # near-identical timelines for plans that were never active - and, because each
+                # one updates the "last logged" state, makes the real cycle's line look changed.
+                #
+                # Recorded here but rendered later: this runs before the rate fetch, so the cheap
+                # ('-') background would read from the previous cycle's rates - and be empty
+                # altogether on the first cycle after a restart. The dispatch lists and the
+                # plugged-in reading are only correct here though: further down this function the
+                # Octopus branch overwrites car_charging_planned with "has dispatch slots", so
+                # capture the inputs now and render once the rates are known.
+                if save:
+                    self.dispatch_timeline_pending.append(
+                        {
+                            "car_n": car_n,
+                            "completed": completed,
+                            "started": started,
+                            "planned": planned,
+                            "plugged": self.car_charging_planned[car_n],
+                            "charging_now": self.get_car_charging_now_tristate(car_n),
+                        }
+                    )
+
                 # Extract vehicle preference if we can get it
                 if self.octopus_intelligent_charging:
                     octopus_ready_time = self.get_arg("octopus_ready_time", None, index=car_n)
@@ -1356,9 +1647,10 @@ class Fetch:
                     self.octopus_slots[car_n] = self.add_now_to_octopus_slot(car_n, self.octopus_slots[car_n], self.now_utc)
                     if not entity_id_list[car_n]:
                         continue
-                    if not self.octopus_intelligent_ignore_unplugged or self.car_charging_planned[car_n]:
+                    if not self.octopus_intelligent_ignore_unplugged or self.car_charging_planned[car_n] or self.car_charging_now[car_n]:
                         self.car_charging_slots[car_n] = self.load_octopus_slots(car_n, self.octopus_slots[car_n], self.octopus_intelligent_consider_full)
                         if self.car_charging_slots[car_n]:
+                            iog_slot_cars.append(car_n)
                             self.log(
                                 "Car {} using Octopus Intelligent, charging planned - charging limit {}, ready time {} - battery size {}".format(
                                     car_n, self.car_charging_limit[car_n], self.car_charging_plan_time[car_n], self.car_charging_battery_size[car_n]
@@ -1386,6 +1678,19 @@ class Fetch:
             ready_time = self.parse_car_ready_time(self.get_arg("car_charging_ready_time", None, index=car_n))
             if ready_time:
                 self.car_charging_plan_time[car_n] = ready_time
+
+        # Model-facing car charge limit (#4967). With octopus_intelligent_consider_full off (the
+        # default) the prediction must trust the Octopus dispatch plan rather than modelling the car
+        # filling up, so cars carrying IOG slots get an uncapped limit for predict()'s fill clamp
+        # (which also releases the battery discharge hold once the modelled car "fills"). The real
+        # car_charging_limit is left untouched - execute.py's "car is full" decision, the
+        # plan_car_charging path and load_octopus_slots all still need it. None means no override.
+        if iog_slot_cars and not self.octopus_intelligent_consider_full:
+            self.car_charging_limit_model = self.car_charging_limit[:]
+            for car_n in iog_slot_cars:
+                self.car_charging_limit_model[car_n] = CAR_CHARGING_LIMIT_UNCAPPED
+        else:
+            self.car_charging_limit_model = None
 
         # Log final car SoC (initialised before the IOG loop, updated per-car after Octopus battery_size is read)
         if self.num_cars:
@@ -1564,14 +1869,14 @@ class Fetch:
         self.log("Downloaded {} datapoints from GECloudData going back {} days".format(len(self.load_minutes), self.load_minutes_age))
         return True
 
-    def rate_replicate(self, rates, rate_io={}, is_import=True, is_gas=False):
+    def rate_replicate(self, rates, rate_io=None, is_import=True, is_gas=False):
         """
         We don't get enough hours of data for Octopus, so lets assume it repeats until told others
         """
+        if rate_io is None:
+            rate_io = {}
         minute = -24 * 60
         rate_last = 0
-        rate_first = 0
-        rate_first_valid = False
         rate_last_valid = False  # Track if we've seen any real rates yet
         adjusted_rates = {}
         replicated_rates = {}
@@ -1631,28 +1936,60 @@ class Fetch:
             else:
                 rate_last = rates[minute]
                 rate_last_valid = True
-                if not rate_first_valid:
-                    rate_first = rate_last
-                    rate_first_valid = True
             minute += 1
 
         return rates, replicated_rates
 
+    def carbon_replicate(self, carbon_data):
+        """
+        Extend the carbon intensity forecast forward to cover the whole plan horizon.
+
+        The Carbon Intensity API only publishes about 48 hours ahead, and publishes a good deal
+        less than that whenever the upstream forecast is late, so the tail of the plan can easily
+        have no data at all. A missing minute is scored as zero gCO2/kWh by prediction.py, which
+        makes the uncovered part of the plan look carbon free and biases the optimiser towards it,
+        so fill the gaps the same way rate_replicate does for missing rates - repeat the same time
+        of day 24 hours earlier, falling back to the last known value where there is no such point
+        yet. Carbon intensity has a strong daily cycle (the solar dip and the evening peak), so the
+        previous day is a far better estimate than either zero or a flat average.
+
+        Nothing is invented before the first real value, so an empty forecast stays empty rather
+        than becoming a plan full of fabricated zeroes.
+
+        :param carbon_data: carbon intensity in gCO2/kWh by minute relative to now
+        :return: the extended data and a dict of which minutes were replicated
+        """
+        replicated_carbon = {}
+        carbon_last = None
+        minute = 0
+
+        while minute < self.forecast_minutes:
+            if minute in carbon_data:
+                carbon_last = carbon_data[minute]
+            elif carbon_last is not None:
+                # Take the same time of day yesterday, which may itself have been replicated
+                # so that the daily cycle keeps repeating across the whole horizon
+                previous_day = minute - 24 * 60
+                carbon_data[minute] = carbon_data[previous_day] if previous_day in carbon_data else carbon_last
+                replicated_carbon[minute] = True
+            minute += 1
+
+        return carbon_data, replicated_carbon
+
     def calc_pv_light_dark(self):
         """
-        Decide whether a dawn light/dark boundary is worth computing at all, and return it via
-        calc_dawn if so - otherwise an empty dict (no split).
+        Compute the dawn light/dark split via calc_dawn().
 
-        Only combine_charge_slots can merge a charge window across dawn in the first place - with it
-        off, find_charge_window already forces a break every charge_slot_split minutes (which equals
-        plan_interval_minutes, the same granularity calc_dawn buckets at), so the dawn boundary could
-        never be reached and computing it would be a pure no-op. This used to be gated on
-        set_charge_low_power instead, since that was the only feature that needed the split - but the
-        split also lets the plan optimizer charge just the dark portion of a combined window and skip
-        the daylight portion (where solar may cover the load) on its own merits, independent of low
-        power charging, so it now runs for any combine_charge_slots user.
+        Always computed, even when combine_charge_slots is off: with it off, find_charge_window
+        already forces a window break every charge_slot_split minutes (which equals
+        plan_interval_minutes, the same granularity calc_dawn buckets at), so the dawn boundary can
+        never actually be reached there and calc_dawn's result is a no-op for window splitting in
+        that case - but binary_sensor.predbat_dawn (published from this same result, see
+        fetch_pv_forecast_and_dawn) is a useful standalone signal regardless of combine_charge_slots,
+        and used to read permanently "off" for anyone with it disabled (the default) even in broad
+        daylight, which is what it is not meant to mean.
         """
-        return self.calc_dawn() if self.combine_charge_slots else {}
+        return self.calc_dawn()
 
     def calc_dawn(self):
         """
@@ -1679,13 +2016,21 @@ class Fetch:
         day correctly stay all-dark (dawn never crosses) and a polar-day day correctly stay all-light
         (crossed from the very first bucket).
 
-        The threshold itself is LOW_POWER_PV_LIGHT_FRACTION of the peak PV forecast anywhere in
-        self.pv_forecast_minute, not a fixed Watts figure, so it scales with the site rather than being
-        picked for a "typical" system size.
+        The threshold is the user-configurable low_power_pv_threshold_w, an absolute Watts figure,
+        rather than a fraction of this forecast's own peak. A fraction-of-peak threshold sounds like it
+        "scales with the site", but it actually scales with today's weather: a heavily overcast day has
+        a low peak of its own, so a fixed fraction of it can call a trickle of PV "light" at a much
+        lower absolute wattage than the same fraction would on a clear day - and there is nothing in
+        Predbat today recording the site's real panel capacity to normalise against instead (only
+        inverter_limit, which caps the inverter's own output, not the array's rating). An absolute
+        figure the user sets once for their own system does not have that problem (#4699 follow-up).
+        The same value and the same comparison is reused by find_charge_rate's low-power abandon check
+        (utils.py) - one threshold answering "is this bright enough to matter" everywhere it is asked,
+        rather than two independently-tuned ones that could disagree on genuine twilight PV.
 
-        Built from whatever PV forecast is already in self.pv_forecast_minute, which at the point this
-        is called from fetch_sensor_data is up to one cycle stale (refreshed later this same loop by
-        fetch_pv_forecast()) - fine for a forecast that doesn't meaningfully change minute to minute.
+        Built from self.pv_forecast_minute as populated earlier this same fetch_sensor_data() call by
+        fetch_pv_forecast() - see #4699, where calc_pv_light_dark() ran before that populating call and
+        so always saw the freshly-reset empty dict, silently disabling the dawn split for everyone.
 
         Logs the calculated dawn time (today's, or the earliest day the forecast reaches if today's PV
         data isn't there) each time it runs, so it's visible whether the detected dawn looks sane.
@@ -1694,11 +2039,7 @@ class Fetch:
         if not self.pv_forecast_minute:
             return pv_light_dark
 
-        peak_pv = max(self.pv_forecast_minute.values())
-        if peak_pv <= 0:
-            return {pv_minute: 0 for pv_minute in self.pv_forecast_minute}
-
-        light_threshold = peak_pv * LOW_POWER_PV_LIGHT_FRACTION
+        light_threshold = self.low_power_pv_threshold_w / MINUTE_WATT
         interval = self.plan_interval_minutes
         bucket_sums = {}
         bucket_counts = {}
@@ -1855,10 +2196,14 @@ class Fetch:
 
         return rates
 
-    def basic_rates(self, info, rtype, prev=None, rate_replicate=None):
+    def basic_rates(self, info, rtype, prev=None, rate_replicate=None, include_manual_api=True):
         """
         Work out the energy rates based on user supplied time periods
         works on a 24-hour period only and then gets replicated later for future days
+
+        include_manual_api should be False for callers (e.g. tariff comparison, annual replay)
+        that simulate a tariff other than the live one - the live system's manual API overrides
+        apply to the actual running plan and must not leak into those simulations.
         """
         rates = {}
         if rate_replicate is None:
@@ -1874,7 +2219,26 @@ class Fetch:
                 rates[minute] = 0
             max_minute = 48 * 60
 
-        manual_items = self.get_manual_api(rtype)
+        # get_manual_api() returns each override wrapped as {"index": ..., "value": {...}}, not the
+        # flat {"start": ..., "end": ..., "rate": ...} shape this loop expects below - unwrap it here.
+        # Before this fix, an unwrapped entry's this_rate.get("start")/get("rate") always missed,
+        # falling through to the "00:00:00" start/end default (which, since end<=start, wraps to a
+        # full 24-hour range) and the rate=0/rate_increment=True default (a genuine no-op on the
+        # rate value) - silently marking every minute of the day as overridden in rate_replicate
+        # (and hence in the plan display) even for the narrowest override window (batpred#2578).
+        # For most callers (anything sourced via get_arg(..., default=[]), which already merges
+        # manual API overrides into its own return value) this would duplicate an override already
+        # present in `info`. Avoid double-applying, as incremental overrides would otherwise stack.
+        manual_items = []
+        if include_manual_api:
+            for item in self.get_manual_api(rtype):
+                value = item.get("value")
+                if not isinstance(value, dict):
+                    self.log("Warn: Manual API override for {} must use the '?start=...&end=...&rate=...' form, got {}".format(rtype, value))
+                    self.record_status("Warn: Manual API override for {} must use the '?start=...&end=...&rate=...' form".format(rtype), had_errors=True)
+                    continue
+                if value not in info:
+                    manual_items.append(value)
         if manual_items:
             self.log("Basic rate API override items for {} are {}".format(rtype, manual_items))
 
@@ -1943,9 +2307,9 @@ class Fetch:
                     rate_increment = True
 
                 # Resolve any sensor links
-                if isinstance(rate, str) and rate[0].isalpha():
+                if isinstance(rate, str) and rate and rate[0].isalpha():
                     rate = self.resolve_arg("rate", rate, 0.0)
-                if isinstance(load_scaling, str) and load_scaling[0].isalpha():
+                if isinstance(load_scaling, str) and load_scaling and load_scaling[0].isalpha():
                     load_scaling = self.resolve_arg("load_scaling", load_scaling, 1.0)
 
                 # Ensure the end result is a float
@@ -1972,9 +2336,22 @@ class Fetch:
                 if end_minutes <= start_minutes:
                     end_minutes += 24 * 60
 
+                # A window flagged utc is given in UTC rather than local wall-clock time, so shift it
+                # by the local offset. That keeps a UTC-fixed schedule - an Economy 7 smart meter, for
+                # instance - aligned with the meter through British Summer Time instead of running an
+                # hour early. The offset is taken at local midnight, which is the reference the
+                # returned minute keys are relative to.
+                if this_rate.get("utc", False):
+                    utc_offset = self.midnight_utc.utcoffset()
+                    offset_minutes = int(utc_offset.total_seconds() // 60) if utc_offset else 0
+                    start_minutes += offset_minutes
+                    end_minutes += offset_minutes
+
                 # Adjust for date if specified
                 if date:
-                    delta_minutes = minutes_to_time(date, self.midnight)
+                    # Carry midnight_utc's offset so this stays a plain wall-clock difference in
+                    # whole days, whichever side of a DST change the date falls on.
+                    delta_minutes = minutes_to_time(date.replace(tzinfo=self.midnight_utc.tzinfo), self.midnight_utc)
                     start_minutes += delta_minutes
                     end_minutes += delta_minutes
 
@@ -1982,7 +2359,7 @@ class Fetch:
                     "Adding rate {}: {}{} => {} to {} @ {}{}, date {}, day_of_week {}, increment {}{}".format(rtype, this_rate, curr, self.time_abs_str(start_minutes), self.time_abs_str(end_minutes), rate, curr, date, day_of_week, rate_increment, curr)
                 )
 
-                day_of_week_midnight = self.midnight.weekday()
+                day_of_week_midnight = self.midnight_utc.weekday()
 
                 # Store rates against range
                 if end_minutes >= (-48 * 60) and start_minutes < max_minute:
@@ -2108,7 +2485,6 @@ class Fetch:
         found_rates = []
         lowest = 99
         highest = -99
-        upcoming_period = self.minutes_now + 4 * 60
 
         while True:
             rate_low_start, rate_low_end, rate_low_average = self.find_charge_window(rates, minute, threshold_rate, find_high, alt_rates=alt_rates, pv_light_dark=pv_light_dark)
@@ -2246,6 +2622,31 @@ class Fetch:
             return None
         return value
 
+    def get_car_charging_now_tristate(self, car_n):
+        """
+        Read car_charging_now as a tri-state (True/False/None) for the #4516 Stage 1 dispatch
+        timeline's GH#5080 reconciliation note.
+
+        self.car_charging_now (set by get_car_charging_planned()) is a plain boolean used
+        throughout the planner, where "no signal" and "confirmed not charging" both have to mean
+        False - there is no room there for a genuine unknown. This diagnostic needs that
+        distinction: flagging a slot as billing-risk when Predbat actually has no idea whether the
+        car is charging would be a false positive on every dispatch, for every IOG user who hasn't
+        configured the (optional) car_charging_now sensor, or during the "unknown"/"unavailable"
+        state HA reports for a real sensor briefly after a restart.
+
+        Returns None (unknown) when the sensor isn't configured, is out of range for this car, or
+        HA is currently reporting "unknown"/"unavailable"; otherwise the normalised boolean.
+        """
+        if "car_charging_now" not in self.args:
+            return None
+        raw = self.get_arg("car_charging_now", "no", index=car_n)
+        if raw is None:
+            return None
+        if isinstance(raw, str) and raw.lower() in ("unknown", "unavailable"):
+            return None
+        return self.car_charging_now[car_n]
+
     def get_car_charging_planned(self):
         """
         Get the car attributes
@@ -2351,7 +2752,7 @@ class Fetch:
         if self.num_cars > 0:
             car_charging_limit_percent = [dp1(limit / size * 100) if size else 0 for limit, size in zip(self.car_charging_limit, self.car_charging_battery_size)]
             self.log(
-                "Cars {} charging from battery {} planned {}, charging_now {} smart {}, max_price {}{}, plan_time {}, battery size {}kWh, limit {}% ({}kWh), rate {}kW, exclusive {}".format(
+                "Cars {} charging from battery {} planned {}, charging_now {} smart {}, max_price {}{}, plan_time {}, battery size {}kWh, limit {}% ({}kWh), rate {}kW, exclusive {} (Predbat-led car settings, not Octopus Intelligent state)".format(
                     self.num_cars,
                     self.car_charging_from_battery,
                     self.car_charging_planned,
@@ -2414,10 +2815,65 @@ class Fetch:
                     return load_forecast
         return {}
 
+    def fetch_ml_load_forecast_history(self, now_utc):
+        """
+        Reconstruct a genuine past Load ML forecast for the elapsed part of today.
+
+        sensor.<prefix>_load_ml_stats publishes a load_today_h1 attribute every cycle: the model's
+        cumulative-load-since-midnight prediction for 60 minutes after that cycle ran. Shifting each
+        recorded reading's timestamp forward by that same 60-minute lead turns the entity's history
+        into a genuine record of what the model predicted for each past target minute - unlike a
+        same-time-of-day historical average, this is the model's own past output (batpred#4750).
+
+        Covers 2 days of history so a reading from shortly before local midnight (whose target minute
+        falls just after midnight) is included, rather than leaving the first hour of the day as a gap.
+        """
+        entity_id = "sensor." + self.prefix + "_load_ml_stats"
+        history = self.get_history_wrapper(entity_id, days=2, required=False)
+        if not history:
+            return {}
+
+        data_array = []
+        for record in history[0]:
+            attributes = record.get("attributes") or {}
+            value = attributes.get("load_today_h1")
+            last_updated = record.get("last_updated")
+            if value is None or not last_updated:
+                continue
+            try:
+                shifted_time = str2time(last_updated) + timedelta(minutes=60)
+            except (ValueError, TypeError):
+                continue
+            data_array.append({"energy": value, "last_updated": shifted_time.isoformat()})
+
+        if not data_array:
+            return {}
+
+        load_forecast, _ = minute_data(
+            data_array,
+            self.forecast_days + 1,
+            self.midnight_utc,
+            "energy",
+            "last_updated",
+            backwards=False,
+            clean_increment=False,
+            smoothing=True,
+            divide_by=1.0,
+            scale=1.0,
+        )
+        return load_forecast or {}
+
     def get_holiday_minutes(self, now_utc, num_days):
         """
         Build a per-minute history of the holiday_days_left value (indexed by minutes-ago) from the recorded
         entity history using minute_data, which holds each state forward until the next change.
+
+        Covers num_days + 1 days rather than num_days: a sample taken "num_days whole days ago at time of
+        day tod" reaches minutes_now past the num_days boundary, so a num_days map leaves the oldest day
+        in the window unreadable for every slot with tod <= minutes_now (batpred#4732). This mirrors the
+        load history window, which is deliberately max_days_previous = window_days + 1 for the same reason.
+        Both the fetch and the minute_data span have to be widened - minute_data bounds its map at
+        days * 24 * 60, so raising the index alone would just return the not-on-holiday default instead.
 
         Returns the minute_data dict, or None when no usable history is available.
         """
@@ -2426,15 +2882,16 @@ class Fetch:
         if not entity_id:
             return None
 
+        history_days = num_days + 1
         try:
-            history = self.get_history_wrapper(entity_id=entity_id, days=num_days, required=False)
+            history = self.get_history_wrapper(entity_id=entity_id, days=history_days, required=False)
         except (ValueError, TypeError):
             history = None
 
         if not history or not isinstance(history, list) or not history[0]:
             return None
 
-        holiday_minutes, _ = minute_data(history[0], num_days, now_utc, "state", "last_updated", backwards=True)
+        holiday_minutes, _ = minute_data(history[0], history_days, now_utc, "state", "last_updated", backwards=True)
         return holiday_minutes or None
 
     def compute_load_forecast_history(self, now_utc):
@@ -2444,13 +2901,21 @@ class Fetch:
 
         For each forward 5-minute slot the historical sample at the same time-of-day is gathered from each
         available past day and combined as a weighted average, ignoring zero (missing-data) buckets entirely.
-        Per-sample weight = weekday_factor * holiday_factor * age_factor:
+
+        Only days whose holiday state matches that of the day the slot falls on are averaged - the holiday
+        state is matched per sample (not per whole day) so a mid-day change of holiday mode is handled
+        correctly, and per forward day (not just today's) so the day you come home is planned against
+        non-holiday history. Per-sample weight = weekday_factor * age_factor:
           - weekday_factor: 1.0 if the historical day is the same weekday as today; else 0.7 if both are
-            weekend or both are weekday; else 0.5 (one weekday, one weekend).
-          - holiday_factor: 1.0 if the holiday state when that individual 5-minute sample was recorded matches
-            today's holiday state; else 0.5. This is matched per sample (not per whole day) so a mid-day change
-            of holiday mode is handled correctly.
+            weekend or both are weekday; else 0.5 (one weekday, one weekend). Held at 1.0 between two
+            holiday days: holiday load has no weekday structure, and discarding weight from a pool of two
+            or three matching days only amplifies noise.
           - age_factor: 0.9 for yesterday, reducing by 0.03 per day down to a floor of 0.1.
+
+        A slot with no matching history at all - the first 24 hours of a holiday, or a return from one
+        longer than the search window - falls back to the plain weighted average of every day scaled by
+        holiday_load_scaling (or divided by it when coming home), so holiday mode acts from the moment it
+        is switched on rather than waiting for a day of holiday history to accumulate (batpred#4732).
 
         Returns a cumulative-from-midnight kWh dict (same format as the ML load forecast), or {} if no data.
         """
@@ -2462,12 +2927,17 @@ class Fetch:
             return {}
 
         today_dow = now_utc.weekday()
-        today_holiday = self.holiday_days_left > 0
         holiday_minutes = self.get_holiday_minutes(now_utc, num_days)
-        max_holiday_index = num_days * 24 * 60 - 1
+        # get_holiday_minutes covers num_days + 1 days so the oldest day in the window stays readable for
+        # every slot; anything older than that is genuinely unknown (a purged or short recorder history)
+        max_holiday_index = (num_days + 1) * 24 * 60 - 1
+        # Assumed holiday load as a fraction of normal, used only for slots with no matching history
+        holiday_load_scaling = min(max(self.holiday_load_scaling, 0.1), 1.0)
 
-        # Precompute the static per-day weight (weekday * age); the holiday factor is applied per 5-minute bucket
+        # Precompute the per-day weights; the holiday state is matched per 5-minute bucket below. The age-only
+        # weight is what a holiday-to-holiday match uses, the weekday * age weight everything else.
         day_static_weight = {}
+        day_age_weight = {}
         for d in range(1, num_days + 1):
             hist_dow = (now_utc - timedelta(days=d)).weekday()
             if hist_dow == today_dow:
@@ -2479,6 +2949,7 @@ class Fetch:
                 weekday_factor = 0.5
             # Age: 0.9 for yesterday (d=1), reducing by 0.03 per day down to a floor of 0.1
             age_factor = max(0.1, 0.9 - (d - 1) * 0.03)
+            day_age_weight[d] = age_factor
             day_static_weight[d] = weekday_factor * age_factor
 
         # Build the per-step (5-minute) weighted-average estimate, keyed by minute-from-midnight, across the
@@ -2488,8 +2959,14 @@ class Fetch:
         per_step = {}
         for minute_absolute in range(0, horizon_end, PREDICT_STEP):
             tod = minute_absolute % (24 * 60)  # time of day of this slot
-            total = 0.0
-            total_weight = 0.0
+            # Holiday state of the day this slot falls on, not of today. holiday_days_left counts whole days
+            # remaining including today and is decremented at midnight, so the day you travel home (and every
+            # day after it) is planned against non-holiday history while you are still away.
+            slot_holiday = self.holiday_days_left > (minute_absolute // (24 * 60))
+            match_total = 0.0
+            match_weight = 0.0
+            all_total = 0.0
+            all_weight = 0.0
             for d in range(1, num_days + 1):
                 # Sample d whole days ago at this slot's time of day. Counting in whole days from today keeps
                 # each day distinct and handles midnight crossings (the slot may be tomorrow or later).
@@ -2500,18 +2977,29 @@ class Fetch:
                 sample, raw = self.get_filtered_load_minute(self.load_minutes, minute_previous, historical=False, step=PREDICT_STEP, base_in_raw=False)
                 if raw <= 0:
                     continue
-                # Match the holiday state at the moment this individual sample was recorded (per bucket). If
-                # the sample is older than the holiday history we have, treat it as matching today (neutral)
-                # rather than reusing the oldest known state.
+                # Holiday state at the moment this individual sample was recorded (per bucket). A sample older
+                # than the holiday history we hold is treated as not on holiday, the same default minute_data
+                # gives for a gap inside the window - treating it as matching instead would hand full weight to
+                # exactly the pre-holiday days holiday mode exists to discount.
                 if holiday_minutes is None or minute_previous > max_holiday_index:
-                    holiday_active = today_holiday
+                    holiday_active = False
                 else:
                     holiday_active = holiday_minutes.get(minute_previous, 0) > 0
-                holiday_factor = 1.0 if (holiday_active == today_holiday) else 0.5
-                weight = day_static_weight[d] * holiday_factor
-                total += sample * weight
-                total_weight += weight
-            per_step[minute_absolute] = (total / total_weight) if total_weight > 0 else 0.0
+                all_total += sample * day_static_weight[d]
+                all_weight += day_static_weight[d]
+                if holiday_active == slot_holiday:
+                    weight = day_age_weight[d] if slot_holiday else day_static_weight[d]
+                    match_total += sample * weight
+                    match_weight += weight
+            if match_weight > 0:
+                per_step[minute_absolute] = match_total / match_weight
+            elif all_weight > 0:
+                # Nothing in the window shares this slot's holiday state. Rather than leaving holiday mode inert
+                # (a normalised mean cannot express "all of my data is wrong"), fall back to every day scaled by
+                # the assumed holiday ratio - or divided by it when we are home and the whole window was holiday.
+                per_step[minute_absolute] = (all_total / all_weight) * (holiday_load_scaling if slot_holiday else 1.0 / holiday_load_scaling)
+            else:
+                per_step[minute_absolute] = 0.0
 
         # Convert per-step kWh buckets into a cumulative-from-midnight dict, filling every minute by linear
         # interpolation across each 5-minute span so get_from_incrementing(..., backwards=False) reproduces
@@ -2526,6 +3014,29 @@ class Fetch:
         # Final boundary so the last span's increment is well defined
         load_forecast[horizon_end] = dp4(cumulative)
         return load_forecast
+
+    def apply_load_ml_forecast_history(self, now_utc, ml_forecast=None):
+        """
+        Backfill the elapsed part of today with genuine past Load ML predictions.
+
+        Only takes effect when Load ML is genuinely the active forecast source this cycle, which is
+        exactly "fetch_sensor_data() fetched a non-empty ml_forecast this cycle" - a Load ML component
+        running in the background without being selected as the forecast source
+        (load_ml_enable/load_ml_source) must not influence the chart, so it has no effect and the
+        weighted-bucket historical forecast above (skipped while Load ML owns load_forecast_only) is
+        what would apply instead. This is passed in rather than held on self so there is no cycle-scoped
+        flag whose correctness depends on fetch_config_options() always running first (#4762 review).
+        Load ML's own forecast entity only ever publishes predictions from "now" onward
+        (load_ml_component.py _publish_entity), so without this the already-elapsed part of today has no
+        forecast data at all and load_today_comparison's Predicted chart series sits at zero from
+        midnight until "now" (batpred#4750).
+        """
+        if not ml_forecast:
+            return
+        h1_forecast = self.fetch_ml_load_forecast_history(now_utc)
+        for minute, value in h1_forecast.items():
+            if minute < self.minutes_now:
+                self.load_forecast[minute] = value
 
     def fetch_extra_load_forecast(self, now_utc, ml_forecast=None):
         """
@@ -2612,6 +3123,9 @@ class Fetch:
             data_all = self.get_state_wrapper(entity_id=entity_id, attribute="forecast")
             if data_all:
                 carbon_data, _ = minute_data(data_all, self.forecast_days, self.now_utc, "intensity", "from", backwards=False, to_key="to")
+                carbon_data, carbon_replicated = self.carbon_replicate(carbon_data)
+                if carbon_replicated:
+                    self.log("Warn: Carbon intensity forecast only covers {} hours of the {} hour plan, replicating it forward to cover the rest".format(dp1(min(carbon_replicated) / 60), dp1(self.forecast_minutes / 60)))
 
         entity_id = self.prefix + ".carbon_now"
         state = self.get_state_wrapper(entity_id=entity_id)
@@ -2676,6 +3190,7 @@ class Fetch:
 
         # Days previous
         self.holiday_days_left = self.get_arg("holiday_days_left")
+        self.holiday_load_scaling = self.get_arg("holiday_load_scaling", 0.7)
         self.load_forecast_only = self.get_arg("load_forecast_only", False)
 
         self.days_previous = self.get_arg("days_previous", [7])
@@ -2694,11 +3209,13 @@ class Fetch:
             # runs unconditionally every cycle regardless of whether the weighted-bucket forecast
             # actually gets used: Load ML (or any other source that sets load_forecast_only) takes
             # precedence and skips it entirely (fetch_sensor_data(), guarded by
-            # "not self.load_forecast_only"). The "using weighted-bucket..." wording previously
-            # here read as if it was happening every cycle regardless, which is what actually gets
-            # logged only when the forecast is genuinely used (fetch_sensor_data()'s own "Using
-            # weighted-bucket historical load forecast over N days" line) - confusing on a Load ML
-            # setup where this fallback is rarely/never actually invoked (#4496 follow-up).
+            # "not self.load_forecast_only") - apply_load_ml_forecast_history() backfills the
+            # elapsed part of today from Load ML's own history instead in that case (batpred#4750).
+            # The "using weighted-bucket..." wording previously here read as if it was happening
+            # every cycle regardless, which is what actually gets logged only when the forecast is
+            # genuinely used (fetch_sensor_data()'s own "Using weighted-bucket historical load
+            # forecast over N days" line) - confusing on a Load ML setup where this fallback is
+            # rarely/never actually invoked (#4496 follow-up).
             self.log("days_previous_auto enabled - will fall back to a weighted-bucket historical load forecast over up to {} days if no other load forecast source takes precedence".format(window_days))
             self.max_days_previous = window_days + 1
         elif self.holiday_days_left > 0:
@@ -2778,6 +3295,8 @@ class Fetch:
         self.inverter_loss = 1.0 - self.get_arg("inverter_loss")
         self.inverter_hybrid = self.get_arg("inverter_hybrid")
         self.pv_ac_limit = self.get_arg("pv_ac_limit", 0.0) / MINUTE_WATT
+        self.inverter_freeze_export_discharge_rate = max(self.get_arg("inverter_freeze_export_discharge_rate", 0.0), 0.0) / MINUTE_WATT
+        self.log("Freeze Export discharge rate configured: {:.0f} W".format(self.inverter_freeze_export_discharge_rate * MINUTE_WATT))
         self.base_load = self.get_arg("base_load", 100) / 1000.0
 
         # Charge curve
@@ -2840,9 +3359,12 @@ class Fetch:
         self.set_reserve_hold = True
         self.set_export_freeze = self.get_arg("set_export_freeze")
         self.set_charge_freeze = self.get_arg("set_charge_freeze")
+        self.set_charge_freeze_only = self.get_arg("set_charge_freeze_only")
         self.set_charge_low_power = self.get_arg("set_charge_low_power")
         self.set_export_low_power = self.get_arg("set_export_low_power")
         self.charge_low_power_margin = self.get_arg("charge_low_power_margin")
+        self.low_power_pv_threshold_w = self.get_arg("low_power_pv_threshold_w")
+        self.set_charge_low_power_solar_full_rate = self.get_arg("set_charge_low_power_solar_full_rate")
         self.calculate_export_first = True
 
         self.set_status_notify = self.get_arg("set_status_notify")
@@ -2965,6 +3487,7 @@ class Fetch:
         self.manual_export_rates = self.manual_rates("manual_export_rates", default_rate=self.get_arg("manual_export_value"))
         self.manual_load_adjust = self.manual_rates("manual_load_adjust", default_rate=self.get_arg("manual_load_value"))
         self.manual_soc_keep = self.manual_rates("manual_soc", default_rate=self.get_arg("manual_soc_value"))
+        self.manual_soc_max_keep = self.manual_rates("manual_soc_max", default_rate=self.get_arg("manual_soc_max_value"))
 
         # Update list of config options to save/restore to
         self.update_save_restore_list()

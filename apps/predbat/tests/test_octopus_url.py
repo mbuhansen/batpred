@@ -13,6 +13,8 @@ import json
 from datetime import datetime, timezone, timedelta
 from unittest.mock import Mock, patch
 from octopus import OctopusAPI, DATE_TIME_STR_FORMAT
+from const import TIME_FORMAT_OCTOPUS
+from utils import dp4
 from tests.test_infra import create_aiohttp_mock_response, create_aiohttp_mock_session
 
 
@@ -28,7 +30,7 @@ def test_octopus_url(my_predbat=None):
     - Tariff finding: Product search, tariff code extraction
     - EDF FreePhase Dynamic: Special tariff handling
 
-    Total: 6 sub-tests
+    Total: 7 sub-tests
     """
 
     # Registry of all Octopus URL tests
@@ -39,6 +41,7 @@ def test_octopus_url(my_predbat=None):
         ("intelligent_dispatch", _test_async_intelligent_update_sensor_wrapper, "Intelligent dispatch (planned, completed, vehicle)"),
         ("find_tariffs", _test_async_find_tariffs_wrapper, "Find tariffs (product search, codes)"),
         ("edf_freephase", _test_edf_freephase_dynamic_url_wrapper, "EDF FreePhase Dynamic tariff handling"),
+        ("payment_method", _test_payment_method_filter, "Overlapping DIRECT_DEBIT / NON_DIRECT_DEBIT rows"),
     ]
 
     print("\n" + "=" * 70)
@@ -639,6 +642,41 @@ def _test_get_saving_session_data(my_predbat):
                 failed = True
             else:
                 print("PASS: All event data fields correctly populated")
+
+    # Test 8: Region-restricted events filtered against the account's own region (issue #4612)
+    print("\n*** Test 8: Region-restricted events filtered against the account's own region ***")
+    api.saving_sessions = {
+        "account": {"hasJoinedCampaign": True, "joinedEvents": [], "signedUpMeterPoint": {"regionId": 10}},
+        "events": [
+            {"id": "in_region", "code": "IN_REGION", "startAt": "2024-06-16T17:00:00+00:00", "endAt": "2024-06-16T18:00:00+00:00", "rewardPerKwhInOctoPoints": 100, "targetRegion": [{"regionId": 10}]},
+            {"id": "out_of_region", "code": "OUT_OF_REGION", "startAt": "2024-06-16T17:00:00+00:00", "endAt": "2024-06-16T18:00:00+00:00", "rewardPerKwhInOctoPoints": 100, "targetRegion": [{"regionId": 3}, {"regionId": 7}]},
+            {"id": "nationwide", "code": "NATIONWIDE", "startAt": "2024-06-16T17:00:00+00:00", "endAt": "2024-06-16T18:00:00+00:00", "rewardPerKwhInOctoPoints": 100, "targetRegion": []},
+        ],
+    }
+
+    with patch.object(type(api), "now_utc_exact", new_callable=lambda: property(lambda self: fixed_time)):
+        available, joined = api.get_saving_session_data()
+
+    available_codes = sorted(event["code"] for event in available)
+    if available_codes != ["IN_REGION", "NATIONWIDE"]:
+        print("ERROR: Expected only IN_REGION and NATIONWIDE events, got: {}".format(available_codes))
+        failed = True
+    else:
+        print("PASS: Out-of-region event excluded, in-region and nationwide events kept")
+
+    # An account with no signedUpMeterPoint (region unknown) can't confirm eligibility for any
+    # region-restricted event, so those are excluded (safer than risking a rejected join) - but
+    # nationwide events (no targetRegion at all) were never restricted, so they still show up.
+    print("\n*** Test 8b: No account region known - region-restricted events excluded, nationwide kept ***")
+    api.saving_sessions["account"]["signedUpMeterPoint"] = None
+    with patch.object(type(api), "now_utc_exact", new_callable=lambda: property(lambda self: fixed_time)):
+        available, joined = api.get_saving_session_data()
+    available_codes = sorted(event["code"] for event in available)
+    if available_codes != ["NATIONWIDE"]:
+        print("ERROR: Expected only NATIONWIDE when account region is unknown, got: {}".format(available_codes))
+        failed = True
+    else:
+        print("PASS: Region-restricted events excluded, nationwide event kept, when account region is unknown")
 
     if not failed:
         print("\n**** All get_saving_session_data tests PASSED ****")
@@ -1263,6 +1301,9 @@ async def test_edf_freephase_dynamic_url(my_predbat):
     my_predbat.failures_total = 0
     # Set midnight_utc to match the test data (2025-12-17)
     my_predbat.midnight_utc = datetime.strptime("2025-12-17T00:00:00+00:00", "%Y-%m-%dT%H:%M:%S%z")
+    # now_utc has to move with midnight_utc - ComponentBase.midnight_utc derives today's
+    # midnight from now_utc (GH#4804), and this pin is left behind for later test modules.
+    my_predbat.now_utc = my_predbat.midnight_utc
     test_url = "https://api.edfgb-kraken.energy/v1/products/EDF_FREEPHASE_DYNAMIC_12M_HH/electricity-tariffs/E-1R-EDF_FREEPHASE_DYNAMIC_12M_HH-J/standard-unit-rates"
 
     with patch("requests.get") as mock_get:
@@ -1377,5 +1418,61 @@ async def test_edf_freephase_dynamic_url(my_predbat):
 
     if not failed:
         print("\n**** All EDF FreePhase Dynamic URL tests PASSED ****")
+
+    return failed
+
+
+def _test_payment_method_filter(my_predbat):
+    """
+    Overlapping DIRECT_DEBIT / NON_DIRECT_DEBIT rows resolve to the direct debit rate
+
+    The REST tariff endpoints return both variants over the same validity window. Before the fix
+    whichever row came last in the response won, so the displayed rate depended on response order.
+
+    Tests:
+    - Test 1: Unit rates, non-direct-debit row last (the order the live API returns today)
+    - Test 2: Unit rates, direct debit row last (the order returned for some older periods)
+    - Test 3: Standing charges, same overlap
+    - Test 4: Rows with payment_method None are untouched (Agile, day/night)
+    - Test 5: A response with only NON_DIRECT_DEBIT rows keeps its rate
+    """
+    print("**** Running payment method filter tests ****")
+    failed = False
+
+    api = OctopusAPI(my_predbat, key="", account_id="", automatic=False)
+    midnight = api.midnight_utc
+    window_from = midnight.strftime(TIME_FORMAT_OCTOPUS)
+    window_to = (midnight + timedelta(days=1)).strftime(TIME_FORMAT_OCTOPUS)
+
+    def row(value, method):
+        """
+        Build one tariff row for the whole of today with the given payment method
+        """
+        return {"value_inc_vat": value, "valid_from": window_from, "valid_to": window_to, "payment_method": method}
+
+    direct_debit = 26.381355
+    non_direct_debit = 27.848835
+
+    cases = [
+        ("Test 1: unit rates, non-direct-debit last", [row(direct_debit, "DIRECT_DEBIT"), row(non_direct_debit, "NON_DIRECT_DEBIT")], False, dp4(direct_debit)),
+        ("Test 2: unit rates, direct debit last", [row(non_direct_debit, "NON_DIRECT_DEBIT"), row(direct_debit, "DIRECT_DEBIT")], False, dp4(direct_debit)),
+        ("Test 3: standing charges", [row(50.65641, "DIRECT_DEBIT"), row(59.313555, "NON_DIRECT_DEBIT")], True, dp4(50.65641)),
+        ("Test 4: payment_method None is untouched", [row(16.5, None)], False, dp4(16.5)),
+        ("Test 5: only non-direct-debit rows", [row(non_direct_debit, "NON_DIRECT_DEBIT")], False, dp4(non_direct_debit)),
+    ]
+
+    for description, rows, standing, expected in cases:
+        print("\n*** {} ***".format(description))
+        if standing:
+            api.tariffs = {"import": {"data": [], "standing": rows}}
+        else:
+            api.tariffs = {"import": {"data": rows, "standing": []}}
+        rates = api.get_octopus_rates_direct("import", standingCharge=standing)
+        got = rates.get(0, None)
+        if got != expected:
+            print("ERROR: Expected {} at minute 0, got {}".format(expected, got))
+            failed = True
+        else:
+            print("PASS: {}".format(expected))
 
     return failed

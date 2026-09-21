@@ -11,6 +11,7 @@
 import os
 import json
 import hashlib
+import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,23 @@ class MockBase:
         """Track dashboard_item calls"""
         self.dashboard_items[entity_id] = {"state": state, "attributes": attributes}
 
+    def resolve_pv_array_kwp(self, detected_kwp):
+        """Mirror Fetch.resolve_pv_array_kwp - fetch_pv_forecast publishes the detected array size through it.
+
+        The apps.yaml override has to win here exactly as it does in production, or a test that sets
+        pv_array_kwp in mock_config would silently exercise the detected value instead.
+        """
+        from const import PV_ARRAY_KWP_UNKNOWN
+
+        configured = self.get_arg("pv_array_kwp", 0.0)
+        if configured and configured > 0:
+            self.pv_array_kwp = float(configured)
+        elif detected_kwp and 0 < detected_kwp < PV_ARRAY_KWP_UNKNOWN:
+            self.pv_array_kwp = float(detected_kwp)
+        else:
+            self.pv_array_kwp = 0.0
+        return self.pv_array_kwp
+
     def minute_data_import_export(self, max_days_previous, now_utc, key, scale=1.0, required_unit=None, increment=True, smoothing=True, pad=True):
         """Return empty history - no historical PV data in tests"""
         return {}
@@ -100,8 +118,10 @@ class MockBase:
             return result
         return default
 
-    def set_state_wrapper(self, entity_id, state, attributes={}, required_unit=None):
+    def set_state_wrapper(self, entity_id, state, attributes=None, required_unit=None):
         """Mock set_state_wrapper"""
+        if attributes is None:
+            attributes = {}
         self.mock_ha_states[entity_id] = {"state": state, "attributes": attributes}
 
     def get_history_wrapper(self, entity_id, days=30, required=False, tracked=True):
@@ -527,7 +547,7 @@ def test_cache_get_url_metrics_forecast_solar(my_predbat):
             return test_api.mock_aiohttp_session()
 
         with patch("solcast.aiohttp.ClientSession", side_effect=create_mock_session):
-            result = run_async(test_api.solar.cache_get_url(url, params, max_age=60))
+            run_async(test_api.solar.cache_get_url(url, params, max_age=60))
 
         # Should increment forecast_solar metrics, not solcast
         if test_api.solar.forecast_solar_requests_total != 1:
@@ -1417,6 +1437,77 @@ def test_publish_pv_stats(my_predbat):
         if now_entity not in test_api.dashboard_items:
             print(f"ERROR: Expected {now_entity} to be published")
             failed = True
+
+    finally:
+        test_api.cleanup()
+
+    return failed
+
+
+def test_publish_pv_stats_ignores_stale_shared_midnight(my_predbat):
+    """publish_pv_stats must not bucket forecast entries against self.midnight_utc (GH#4804).
+
+    calculate_yesterday() (output.py) rewinds the shared self.midnight_utc by one day for the
+    duration of the savings calculation, then restores it ~350 lines later. Components run on
+    their own OS threads (hass.py's create_task uses threading.Thread), and SolarAPI's publish
+    cycle runs on an independent schedule from calculate_yesterday()'s hourly one - so the two
+    can genuinely overlap. If that happens while self.midnight_utc is rewound,
+    publish_pv_stats()'s day-bucketing (day = (this_point - midnight_today).days) used to bucket
+    every entry one day late, emptying "today" and shifting the rest down, until
+    calculate_yesterday() finished and restored the real value.
+
+    Confirmed against a real incident log: at the moment of collision, every "PV Forecast for
+    day dN" value was identical to the previous cycle's dN-1 value, with day 0 always empty -
+    exactly the signature this test reproduces by making midnight_utc desync from now_utc.
+
+    The fix derives midnight_today from now_utc instead of midnight_utc. now_utc is never
+    touched by calculate_yesterday() (only midnight_utc/minutes_now/forecast_minutes and the
+    rate/car fields are faked), the same pattern already used for the equivalent race on the
+    manual-override decode path (userinterface.py's manual_time_origin(), #4900). Deliberately
+    not now_utc_exact: that property is datetime.now(self.local_tz) on the real ComponentBase -
+    the live wall clock, not the fixture's frozen mock_base value - so using it here would make
+    every OTHER publish_pv_stats test (which sets mock_base.now_utc but not now_utc_exact)
+    silently read the real clock instead of the fixture's controlled date.
+    """
+    print("  - test_publish_pv_stats_ignores_stale_shared_midnight")
+    failed = False
+
+    test_api = create_test_solar_api()
+    try:
+        # Simulate the collision: now_utc says it is still 2025-06-15, but midnight_utc - the
+        # field calculate_yesterday() rewinds - has been shifted back a full day, as if a
+        # concurrent calculate_yesterday() call were mid-flight on another thread.
+        test_api.mock_base.now_utc = datetime(2025, 6, 15, 12, 0, 0, tzinfo=pytz.utc)
+        test_api.mock_base.midnight_utc = datetime(2025, 6, 14, 0, 0, 0, tzinfo=pytz.utc)
+
+        pv_forecast_data = [
+            {"period_start": "2025-06-15T06:00:00+0000", "pv_estimate": 0.5, "pv_estimate10": 0.3, "pv_estimate90": 0.7},
+            {"period_start": "2025-06-15T12:00:00+0000", "pv_estimate": 2.0, "pv_estimate10": 1.5, "pv_estimate90": 2.5},
+            {"period_start": "2025-06-15T18:00:00+0000", "pv_estimate": 0.5, "pv_estimate10": 0.3, "pv_estimate90": 0.7},
+            {"period_start": "2025-06-16T12:00:00+0000", "pv_estimate": 2.5, "pv_estimate10": 2.0, "pv_estimate90": 3.0},
+        ]
+
+        with test_api.patch_now_utc_exact():
+            test_api.solar.publish_pv_stats(pv_forecast_data, divide_by=1.0, period=30)
+
+        today_entity = f"sensor.{test_api.mock_base.prefix}_pv_today"
+        if today_entity not in test_api.dashboard_items:
+            print(f"ERROR: Expected {today_entity} to be published")
+            failed = True
+        else:
+            total = test_api.dashboard_items[today_entity]["attributes"].get("total", 0)
+            expected_total = 3.0  # 0.5 + 2.0 + 0.5, the same as the clean-midnight case
+            if abs(total - expected_total) > 0.1:
+                print(f"ERROR: today's total was bucketed against the stale rewound midnight_utc instead of now_utc - expected ~{expected_total} (GH#4804), got {total}")
+                failed = True
+
+        tomorrow_entity = f"sensor.{test_api.mock_base.prefix}_pv_tomorrow"
+        if tomorrow_entity in test_api.dashboard_items:
+            total_tomorrow = test_api.dashboard_items[tomorrow_entity]["attributes"].get("total", 0)
+            expected_tomorrow = 2.5
+            if abs(total_tomorrow - expected_tomorrow) > 0.1:
+                print(f"ERROR: tomorrow's total was shifted, expected ~{expected_tomorrow}, got {total_tomorrow}")
+                failed = True
 
     finally:
         test_api.cleanup()
@@ -2508,6 +2599,20 @@ def capture_unit_factor(test_api):
     return captured
 
 
+def capture_log_messages(test_api):
+    """Wrap solar.log so a test can inspect every message logged during a fetch."""
+    captured = []
+    original = test_api.solar.log
+
+    def wrapper(message, *args, **kwargs):
+        """Record the message then log as normal."""
+        captured.append(message)
+        return original(message, *args, **kwargs)
+
+    test_api.solar.log = wrapper
+    return captured
+
+
 def day_zero_kwh(pv_forecast_data, midnight_utc):
     """Sum pv_estimate over the forecast entries that fall on the first forecast day."""
     total = 0
@@ -2752,7 +2857,10 @@ def test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged(my_predbat):
     """
     The HA sensor path carries its own kW/kWh unit factor in divide_by. Making the period
     recalculation unconditional must leave that path alone, so check all three valid factors
-    (1.0 kWh per slot, 2.0 kW on 30-minute slots, 4.0 kW on 15-minute slots).
+    (1.0 kWh per slot, 2.0 kW on 30-minute slots, 4.0 kW on 15-minute slots). Also checks the
+    #2544 regression: a valid, expected factor must not log a "Warn:" message or imply the
+    data is misleading/unexpected - Solcast's detailedForecast reporting average kW per slot
+    (factor 2.0/4.0) rather than kWh is normal, already-compensated-for behaviour.
     """
     print("  - test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged")
     failed = False
@@ -2783,6 +2891,7 @@ def test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged(my_predbat):
             test_api.set_mock_ha_state("sensor.pv_forecast_today", {"state": str(sensor_total), "detailedForecast": detailed})
 
             captured = capture_unit_factor(test_api)
+            logged = capture_log_messages(test_api)
 
             def create_mock_session(*args, **kwargs):
                 """Create a mock aiohttp session."""
@@ -2796,6 +2905,30 @@ def test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged(my_predbat):
                 print(f"ERROR: HA sensors, {label}: expected the unit factor to stay {expected_factor}, got {unit_factor}")
                 failed = True
 
+            factor_messages = [message for message in logged if "PV Forecast today adds up to" in message]
+            if not factor_messages:
+                print(f"ERROR: HA sensors, {label}: expected a PV Forecast factor log message, got none")
+                failed = True
+            else:
+                message = factor_messages[0]
+                if message.startswith("Warn:"):
+                    print(f"ERROR: HA sensors, {label}: valid, expected factor {expected_factor} logged a Warn: message ({message!r}) - #2544 regression")
+                    failed = True
+                # #2544: the raw forecast total isn't really "kWh" when the data is average-kW
+                # per slot (factor 2.0/4.0) - the message shouldn't label it that way, and should
+                # say what units were actually detected instead.
+                if expected_factor == 1.0:
+                    if "kW average per slot" in message:
+                        print(f"ERROR: HA sensors, {label}: kWh-per-slot data was reported as kW average ({message!r})")
+                        failed = True
+                else:
+                    if "kW average per slot" not in message:
+                        print(f"ERROR: HA sensors, {label}: expected message to say 'kW average per slot' for factor {expected_factor} ({message!r})")
+                        failed = True
+                    if re.search(r"adds up to [\d.]+ kWh", message):
+                        print(f"ERROR: HA sensors, {label}: message still labels the raw kW-average total as 'kWh' ({message!r})")
+                        failed = True
+
             today_entity = f"sensor.{test_api.mock_base.prefix}_pv_today"
             total = test_api.dashboard_items.get(today_entity, {}).get("attributes", {}).get("total", 0)
             if abs(total - sensor_total) > 0.01:
@@ -2806,6 +2939,53 @@ def test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged(my_predbat):
 
         finally:
             test_api.cleanup()
+
+    return failed
+
+
+def test_fetch_pv_forecast_ha_sensors_invalid_factor_still_warns(my_predbat):
+    """
+    A ratio that fits neither the kWh-per-slot nor kW-average-per-slot case (i.e. not 1.0, 2.0
+    or 4.0) is a genuine mismatch worth flagging - unlike the #2544 cases above, this one must
+    still log a "Warn:" message.
+    """
+    print("  - test_fetch_pv_forecast_ha_sensors_invalid_factor_still_warns")
+    failed = False
+
+    test_api = create_test_solar_api()
+    try:
+        test_api.solar.solcast_host = None
+        test_api.solar.solcast_api_key = None
+        test_api.solar.forecast_solar = None
+        test_api.solar.pv_forecast_today = "sensor.pv_forecast_today"
+        test_api.solar.pv_forecast_tomorrow = None
+
+        # Sensor reports 2.0 kWh total, but the detailed forecast sums to 3.0 - a 1.5 ratio,
+        # which is neither a plausible kWh-per-slot nor kW-average-per-slot reading.
+        sensor_total = 2.0
+        start = test_api.mock_base.midnight_utc + timedelta(minutes=10 * 60)
+        detailed = [{"period_start": start.strftime(TIME_FORMAT), "pv_estimate": 3.0}]
+        test_api.set_mock_ha_state("sensor.pv_forecast_today", {"state": str(sensor_total), "detailedForecast": detailed})
+
+        logged = capture_log_messages(test_api)
+
+        def create_mock_session(*args, **kwargs):
+            """Create a mock aiohttp session."""
+            return test_api.mock_aiohttp_session()
+
+        with patch("solcast.aiohttp.ClientSession", side_effect=create_mock_session):
+            run_async(test_api.solar.fetch_pv_forecast())
+
+        factor_messages = [message for message in logged if "PV Forecast today adds up to" in message]
+        if not factor_messages:
+            print("ERROR: expected a PV Forecast factor log message, got none")
+            failed = True
+        elif not factor_messages[0].startswith("Warn:"):
+            print(f"ERROR: expected a Warn: message for an invalid factor, got {factor_messages[0]!r}")
+            failed = True
+
+    finally:
+        test_api.cleanup()
 
     return failed
 
@@ -3052,9 +3232,6 @@ def test_pv_calibration_power_conversion(my_predbat):
     try:
         solar = test_api.solar
         base = test_api.mock_base
-
-        plan_interval = base.plan_interval_minutes  # 5
-        minutes_now = base.minutes_now  # 720 (12:00)
 
         # Build synthetic cumulative pv_today history.
         # We represent 5 previous days.  Each day, the panel produces 2 kWh between
@@ -3306,6 +3483,420 @@ def test_pv_calibration_partial_history(my_predbat):
                     print("ERROR: {}-day history (enabled): best_scaling is 1.3 (disabled default) – calibration appears disabled".format(days_back))
                     failed = True
 
+        finally:
+            test_api.cleanup()
+
+    return failed
+
+
+def _make_h0_history(now_utc, days_back, raw_kw, calibrated_kw=None):
+    """Build an HA-format pv_forecast_h0 history whose state and "now" attribute disagree.
+
+    Points are 30 minutes apart, which survives prune_today's 15-minute grouping, and span one day
+    more than the caller's generation history so hist_days is limited by that history rather than by
+    this one. The state carries calibrated_kw and the "now" attribute carries the raw provider
+    forecast, as publish_pv_stats writes them while calibration is on.
+
+    calibrated_kw of None instead builds the shape a version from before the "now" attribute existed
+    recorded: the same attributes minus "now", and the raw forecast in the state. The fallback has to
+    land on the state rather than on one of the attributes that are still there.
+    """
+    entries = []
+    start = now_utc - timedelta(days=days_back + 1)
+    for step in range((days_back + 1) * 24 * 2 + 1):
+        stamp = (start + timedelta(minutes=30 * step)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+        if calibrated_kw is None:
+            # Pre-"now" shape: the raw forecast is the state, and the attributes that did exist remain
+            entries.append({"last_updated": stamp, "state": str(raw_kw), "attributes": {"now10": raw_kw, "now90": raw_kw, "nowCL": raw_kw * 0.9}})
+        else:
+            entries.append({"last_updated": stamp, "state": str(calibrated_kw), "attributes": {"now": raw_kw, "now10": raw_kw, "now90": raw_kw, "nowCL": calibrated_kw}})
+    return [entries]
+
+
+def _make_mixed_h0_history(now_utc, days_back, raw_kw, pre_now_raw_kw, calibrated_kw, pre_now_days):
+    """Build an h0 history where the oldest `pre_now_days` days predate the "now" attribute.
+
+    Reproduces a user upgrading inside their recorder's retention window: the tail of history is
+    genuinely from a version that only ever recorded the raw forecast as the state (c448c9ff added
+    "now" and calibration in the same change, so a point without "now" never carried a calibrated
+    state either). Points within pre_now_days of the window's start get the pre-upgrade shape (state
+    is pre_now_raw_kw, no "now" attribute); the rest get the post-upgrade shape (state is calibrated,
+    "now" carries raw_kw). The two raw levels are deliberately different so that a test measuring the
+    settled adjustment can tell whether the pre-upgrade days were actually used: a per-point fallback
+    uses every day and measures against the blend of both levels; an all-or-nothing fallback only
+    sees the post-upgrade days are non-empty, drops the rest, and measures against raw_kw alone.
+    """
+    entries = []
+    start = now_utc - timedelta(days=days_back + 1)
+    cutover = start + timedelta(days=pre_now_days)
+    for step in range((days_back + 1) * 24 * 2 + 1):
+        point_time = start + timedelta(minutes=30 * step)
+        stamp = point_time.strftime("%Y-%m-%dT%H:%M:%S+0000")
+        if point_time < cutover:
+            entries.append({"last_updated": stamp, "state": str(pre_now_raw_kw), "attributes": {"now10": pre_now_raw_kw, "now90": pre_now_raw_kw, "nowCL": pre_now_raw_kw * 0.9}})
+        else:
+            entries.append({"last_updated": stamp, "state": str(calibrated_kw), "attributes": {"now": raw_kw, "now10": raw_kw, "now90": raw_kw, "nowCL": calibrated_kw}})
+    return [entries]
+
+
+def _make_uncalibrated_history(now_utc, days_back, raw_kw, covers_days=None):
+    """Build an HA-format history for the uncalibrated forecast sensor.
+
+    Its state IS the raw provider forecast, so unlike the h0 builders above there is no attribute
+    to read and no disagreement between state and attribute to resolve - which is the point of the
+    sensor. Points are 30 minutes apart so they survive prune_today's 15-minute grouping.
+
+    covers_days shortens the series to the most recent covers_days days, reproducing the window
+    just after the sensor was added: Predbat has only been publishing it for part of the window and
+    the rest exists solely on the old h0 sensor.
+
+    The points sit 7 minutes off h0's, as two real sensors' recording times would. Sharing h0's
+    timestamps would let a merge that forgot to trim the overlap pass anyway, by overwriting the
+    identical keys in place.
+    """
+    entries = []
+    span_days = days_back + 1 if covers_days is None else covers_days
+    start = now_utc - timedelta(days=span_days) + timedelta(minutes=7)
+    for step in range(span_days * 24 * 2):
+        stamp = (start + timedelta(minutes=30 * step)).strftime("%Y-%m-%dT%H:%M:%S+0000")
+        entries.append({"last_updated": stamp, "state": str(raw_kw), "attributes": {"friendly_name": "PV Forecast Now Uncalibrated"}})
+    return [entries]
+
+
+def _raw_forecast_adjustment(raw_kw, calibrated_kw=None, days_back=5, actual_kw=0.8, pv_scaling=1.0, h0_history_builder=None, uncalibrated_kw=None, uncalibrated_covers_days=None):
+    """Run pv_calibration against a real h0 history and return the total adjustment it settles on.
+
+    Every past day generates actual_kw continuously, so both the day and the slot ratios reduce to
+    actual_kw over whichever forecast level calibration read the history at. Nothing between
+    get_history_wrapper and the ratios is patched - history_attribute, prune_today and
+    history_attribute_to_minute_data all run - so the returned adjustment is a direct measure of
+    which series calibration learned from.
+
+    uncalibrated_kw, when given, also serves a history for the uncalibrated forecast sensor at that
+    raw level; uncalibrated_covers_days shortens it to the most recent days. Holding it at a
+    different level from raw_kw is what lets a caller tell which sensor calibration actually read.
+    """
+    test_api = create_test_solar_api()
+    solar = test_api.solar
+    base = test_api.mock_base
+    solar.pv_scaling = pv_scaling
+    if h0_history_builder is not None:
+        h0_history = h0_history_builder(base.now_utc_exact)
+    else:
+        h0_history = _make_h0_history(base.now_utc_exact, days_back, raw_kw, calibrated_kw=calibrated_kw)
+    if uncalibrated_kw is None:
+        uncalibrated_history = []
+    else:
+        uncalibrated_history = _make_uncalibrated_history(base.now_utc_exact, days_back, uncalibrated_kw, covers_days=uncalibrated_covers_days)
+
+    # Cumulative pv_today kWh keyed by minutes-ago, a constant actual_kw through every past day
+    hist = {}
+    for day in range(1, days_back + 1):
+        midnight_ago = day * 1440 + base.minutes_now
+        for step in range(0, 24 * 60, 5):
+            minute_ago = midnight_ago - step
+            if minute_ago >= 0:
+                hist[minute_ago] = actual_kw * step / 60.0
+
+    def mock_minute_import_export(max_days_previous, now_utc, key, scale=1.0, required_unit=None, increment=True, smoothing=True, pad=True, _hist=hist):
+        """Return the synthetic pv_today history."""
+        return dict(_hist) if key == "pv_today" else {}
+
+    def mock_get_history(entity_id, days, required=False, _h0=h0_history, _uncalibrated=uncalibrated_history):
+        """Return the synthetic forecast history for whichever sensor is asked for."""
+        if entity_id.endswith("_pv_forecast_h0_uncalibrated"):
+            return _uncalibrated
+        return _h0 if "pv_forecast_h0" in entity_id else []
+
+    base.minute_data_import_export = mock_minute_import_export
+    solar.get_history_wrapper = mock_get_history
+
+    pv_m = {m: 0.02 for m in range(4 * 24 * 60)}
+    pv_data = [{"period_start": "2025-06-15T00:00:00+0000", "pv_estimate": 0.5}]
+
+    try:
+        with test_api.patch_now_utc_exact():
+            solar.pv_calibration(pv_m, dict(pv_m), {}, pv_data, create_pv10=False, divide_by=1.0, max_kwh=5.0, forecast_days=solar.forecast_days)
+        return solar.pv_calibration_total_adjustment
+    finally:
+        test_api.cleanup()
+
+
+def test_pv_calibration_learns_from_raw_forecast(my_predbat):
+    """
+    Calibration must measure actual generation against the raw provider forecast (GH#5116).
+
+    The h0 sensor's state is the calibrated forecast while calibration is on, and the raw provider
+    value is only in its "now" attribute. Reading the state fed calibration its own output while the
+    factors were applied to the uncalibrated series, so the applied factor settled at
+    sqrt(actual / forecast) and only about half of a systematic bias was ever corrected.
+
+    Each case generates 0.8 kW continuously against a 1.0 kW raw forecast, so the true ratio is 0.8.
+    The one 5-minute slot per day lost to the midnight reset of the cumulative pv_today counter puts
+    the expected value a fraction below that, hence the 0.01 tolerance.
+
+      - state 0.9 (calibrated), "now" 1.0 (raw): 0.8, not the 0.89 that reading the state gives
+      - the same history with pv_scaling 0.8: 1.0, because pv_forecast_minute - the series these
+        factors are applied to - already carries pv_scaling, so the history must too
+      - state 1.0 with no attributes at all (pre-"now" history): 0.8 from the state fallback
+    """
+    print("  - test_pv_calibration_learns_from_raw_forecast")
+    failed = False
+
+    cases = [
+        ("raw 'now' attribute preferred over the calibrated state", 0.9, 1.0, 0.8),
+        ("history scaled by pv_scaling to match pv_forecast_minute", 0.9, 0.8, 1.0),
+        ("state used when no history point carries 'now'", None, 1.0, 0.8),
+    ]
+
+    for name, calibrated_kw, pv_scaling, expected in cases:
+        adjustment = _raw_forecast_adjustment(1.0, calibrated_kw=calibrated_kw, pv_scaling=pv_scaling)
+        if abs(adjustment - expected) > 0.01:
+            print("ERROR: {}: total_adjustment {}, expected {}".format(name, adjustment, expected))
+            failed = True
+
+    return failed
+
+
+def test_pv_calibration_learns_from_mixed_upgrade_history(my_predbat):
+    """
+    A history mixing pre-upgrade (no "now" attribute) and post-upgrade points must use all of it.
+
+    Reproduces upgrading inside the HA recorder's retention window: some of the fetched history
+    predates the "now" attribute, the rest postdates it. The per-point fallback in history_attribute
+    should read every day from whichever field it actually has, rather than the old all-or-nothing
+    fallback which only checked whether the whole result was empty and, seeing the post-upgrade days
+    were not, silently dropped the pre-upgrade days entirely.
+
+    5 days of history, 2 pre-upgrade at a raw forecast of 2.0 kW and 3 post-upgrade at 1.0 kW, both
+    against a constant 0.8 kW actual. The two levels are deliberately different so the settled
+    adjustment reveals which days were used: using all 5 days measures against the blended average
+    forecast (0.4 kWh, weighted by the day/slot scoring below); dropping the pre-upgrade days would
+    measure against 1.0 kW alone and settle near 0.8 instead - a value this test would otherwise be
+    unable to distinguish from a correct blend if both levels were equal.
+    """
+    print("  - test_pv_calibration_learns_from_mixed_upgrade_history")
+    failed = False
+
+    days_back = 5
+    pre_now_days = 2
+    raw_kw = 1.0
+    pre_now_raw_kw = 2.0
+    builder = lambda now_utc: _make_mixed_h0_history(now_utc, days_back, raw_kw=raw_kw, pre_now_raw_kw=pre_now_raw_kw, calibrated_kw=0.9, pre_now_days=pre_now_days)
+    adjustment = _raw_forecast_adjustment(1.0, days_back=days_back, h0_history_builder=builder)
+
+    all_post_upgrade_adjustment = _raw_forecast_adjustment(1.0, calibrated_kw=0.9, days_back=days_back)
+    if abs(adjustment - all_post_upgrade_adjustment) < 0.01:
+        print("ERROR: mixed pre/post-upgrade history: total_adjustment {} matches the all-1.0kW result {} - the 2.0kW pre-upgrade days were likely dropped".format(adjustment, all_post_upgrade_adjustment))
+        failed = True
+
+    return failed
+
+
+def test_pv_calibration_prefers_uncalibrated_sensor(my_predbat):
+    """
+    Calibration must read the uncalibrated forecast sensor in preference to the h0 sensor.
+
+    The h0 sensor's "now" attribute carries the same raw value, but Home Assistant's history API
+    defaults to significant_changes_only, which returns only the rows where the *state* changed -
+    so an attribute that moves while the calibrated state rounds flat is simply not returned. The
+    dedicated sensor puts the value calibration depends on in a state, where every change to it is
+    recorded.
+
+    The two sensors are deliberately served different raw levels - 2.0 kW on the uncalibrated
+    sensor against 1.0 kW in h0's "now" - so the settled adjustment says outright which one was
+    read: 0.8 / 2.0 for the new sensor, 0.8 / 1.0 for the attribute.
+    """
+    print("  - test_pv_calibration_prefers_uncalibrated_sensor")
+    failed = False
+
+    adjustment = _raw_forecast_adjustment(1.0, calibrated_kw=0.9, uncalibrated_kw=2.0)
+    expected = 0.4
+    if abs(adjustment - expected) > 0.01:
+        print("ERROR: uncalibrated sensor preferred over h0: total_adjustment {}, expected {} (0.8 against h0's 1.0 'now' would give 0.8)".format(adjustment, expected))
+        failed = True
+
+    return failed
+
+
+def test_pv_calibration_scales_uncalibrated_history_by_pv_scaling(my_predbat):
+    """
+    The uncalibrated sensor's history must be scaled by pv_scaling, exactly once.
+
+    The sensor holds the provider's forecast untouched, while pv_forecast_minute - the series these
+    factors are applied to - is built with scale=pv_scaling. The ratio only means anything with both
+    sides on the same basis. Storing the raw value and scaling on read (rather than publishing an
+    already-scaled value) is also what makes a pv_scaling change take effect across the whole window
+    at once instead of decaying in over the following week.
+
+    1.0 kW raw at pv_scaling 0.5 against 0.8 kW actual settles at 0.8 / 0.5 = 1.6. Every other
+    outcome is a distinct number: reading h0's 2.0 kW "now" instead gives 0.8, scaling twice gives
+    3.2, not scaling at all gives 0.8, and calibration disabling itself gives exactly 1.0.
+    """
+    print("  - test_pv_calibration_scales_uncalibrated_history_by_pv_scaling")
+    failed = False
+
+    adjustment = _raw_forecast_adjustment(2.0, calibrated_kw=1.8, uncalibrated_kw=1.0, pv_scaling=0.5)
+    expected = 1.6
+    if abs(adjustment - expected) > 0.02:
+        print("ERROR: pv_scaling applied to uncalibrated history: total_adjustment {}, expected {}".format(adjustment, expected))
+        failed = True
+
+    return failed
+
+
+def test_pv_calibration_fills_uncalibrated_cutover_from_h0(my_predbat):
+    """
+    The window the uncalibrated sensor does not yet reach must be filled from the h0 history.
+
+    Home Assistant's recorder cannot be back-dated - the REST API writes a state at "now" and there
+    is no state-import service - so the week of history the new sensor is missing on the upgrade
+    that adds it cannot be seeded by writing. It is merged on read instead: the uncalibrated sensor
+    wherever it reaches, the h0 sensor's "now" attribute (falling back to its state) for the older
+    points, which is self-limiting and also covers a purged recorder or a fresh install.
+
+    The sensor covers only the most recent 2 days at 1.0 kW while h0 covers all 6 at 2.0 kW, so
+    each failure mode lands on its own value against the 0.8 kW actual:
+
+      - merged (2 days at 1.0, 3 more at 2.0, recency-weighted): ~0.52
+      - h0 dropped, leaving 2 days - below the 3-day minimum: exactly 1.0, calibration disabled
+      - uncalibrated sensor ignored: 0.4
+    """
+    print("  - test_pv_calibration_fills_uncalibrated_cutover_from_h0")
+    failed = False
+
+    adjustment = _raw_forecast_adjustment(2.0, calibrated_kw=1.8, uncalibrated_kw=1.0, uncalibrated_covers_days=2)
+
+    if abs(adjustment - 1.0) < 0.01:
+        print("ERROR: cutover merge: total_adjustment {} - calibration disabled itself, so the h0 history was not merged in".format(adjustment))
+        failed = True
+    elif abs(adjustment - 0.4) < 0.05:
+        print("ERROR: cutover merge: total_adjustment {} matches the h0-only value of 0.4 - the uncalibrated sensor's days were not used".format(adjustment))
+        failed = True
+    elif abs(adjustment - 0.8) < 0.05:
+        print("ERROR: cutover merge: total_adjustment {} matches the uncalibrated-only value of 0.8 - the older h0 days were counted at the wrong level".format(adjustment))
+        failed = True
+    elif not 0.45 < adjustment < 0.75:
+        print("ERROR: cutover merge: total_adjustment {} is outside the blend of the 1.0 kW and 2.0 kW days (expected ~0.52)".format(adjustment))
+        failed = True
+
+    return failed
+
+
+def test_pv_forecast_history_fetches_h0_only_when_needed(my_predbat):
+    """
+    pv_forecast_history must only request the h0 history when the uncalibrated sensor falls short.
+
+    Once the uncalibrated sensor covers the window - every cycle after its first week - the h0
+    history can contribute nothing, and requesting it anyway doubles the history load of every
+    calibration run for good. When the sensor does fall short, the merged result must come back
+    oldest first with each point from exactly one sensor: h0's (2.0 kW) strictly before the
+    uncalibrated history starts and the uncalibrated sensor's (1.0 kW) from then on. prune_today
+    walks it in order and drops any point less than 15 minutes after the one before, so an
+    out-of-order tail would be silently discarded.
+    """
+    print("  - test_pv_forecast_history_fetches_h0_only_when_needed")
+    failed = False
+
+    h0_entity = "sensor.predbat_pv_forecast_h0"
+    window_days = 8  # what pv_calibration asks for: days + 1
+
+    for covers_days, expect_h0 in ((None, False), (2, True)):
+        label = "sensor covers the window" if covers_days is None else "sensor covers {} days".format(covers_days)
+        test_api = create_test_solar_api()
+        try:
+            solar = test_api.solar
+            base = test_api.mock_base
+            uncalibrated = _make_uncalibrated_history(base.now_utc_exact, window_days - 1, 1.0, covers_days=covers_days)
+            h0 = _make_h0_history(base.now_utc_exact, window_days - 1, 2.0, calibrated_kw=1.8)
+            requested = []
+
+            def recording_get_history(entity_id, days, required=False, _uncalibrated=uncalibrated, _h0=h0, _requested=requested):
+                """Serve the two synthetic histories and record which were asked for."""
+                _requested.append(entity_id)
+                if entity_id.endswith("_pv_forecast_h0_uncalibrated"):
+                    return _uncalibrated
+                return _h0 if entity_id == h0_entity else []
+
+            solar.get_history_wrapper = recording_get_history
+            with test_api.patch_now_utc_exact():
+                history = solar.pv_forecast_history(window_days)
+
+            if (h0_entity in requested) != expect_h0:
+                print("ERROR: {}: h0 history {} but expected it {}".format(label, "requested" if h0_entity in requested else "not requested", "requested" if expect_h0 else "not requested"))
+                failed = True
+
+            stamps = [datetime.strptime(key, "%Y-%m-%dT%H:%M:%S%z") for key in history]
+            if stamps != sorted(stamps):
+                print("ERROR: {}: merged history is not oldest first".format(label))
+                failed = True
+
+            uncalibrated_start = datetime.strptime(uncalibrated[0][0]["last_updated"], "%Y-%m-%dT%H:%M:%S%z")
+            for stamp, value in zip(stamps, history.values()):
+                expected = 2.0 if stamp < uncalibrated_start else 1.0
+                if abs(value - expected) > 0.001:
+                    print("ERROR: {}: point at {} is {} kW, expected {} kW from the {} sensor".format(label, stamp, value, expected, "h0" if expected == 2.0 else "uncalibrated"))
+                    failed = True
+                    break
+
+            if expect_h0 and not any(stamp < uncalibrated_start for stamp in stamps):
+                print("ERROR: {}: no h0 points were merged in ahead of the uncalibrated history".format(label))
+                failed = True
+        finally:
+            test_api.cleanup()
+
+    return failed
+
+
+def test_publish_pv_stats_publishes_uncalibrated_forecast(my_predbat):
+    """
+    The uncalibrated forecast sensor must be published, and must not move with the calibration switch.
+
+    It is the provider's figure for "now", which is exactly what h0's "now" attribute already holds,
+    so the two must agree. h0's own state is the calibrated value while calibration is on and the raw
+    one while it is off - the very flip that makes its history an unsafe basis to measure against -
+    and the new sensor has to be unaffected by it, including being published at all while calibration
+    is off, or the history is not there when the user switches it back on.
+
+    2.0 kWh per 30-minute slot raw against 1.0 kWh calibrated, so the raw power now is 4.0 kW and the
+    calibrated 2.0 kW. pv_scaling is 0.5 and must NOT appear in the published value: calibration scales
+    the history on read, so publishing a scaled value would apply it twice.
+    """
+    print("  - test_publish_pv_stats_publishes_uncalibrated_forecast")
+    failed = False
+
+    uncalibrated_entity = "sensor.predbat_pv_forecast_h0_uncalibrated"
+    h0_entity = "sensor.predbat_pv_forecast_h0"
+
+    for calibration_on in (True, False):
+        test_api = create_test_solar_api()
+        try:
+            test_api.mock_base.set_arg("metric_pv_calibration_enable", calibration_on)
+            test_api.solar.pv_scaling = 0.5
+            pv_forecast_data = [
+                {"period_start": "2025-06-15T12:00:00+0000", "pv_estimate": 2.0, "pv_estimate10": 1.5, "pv_estimate90": 2.5, "pv_estimateCL": 1.0},
+                {"period_start": "2025-06-15T12:30:00+0000", "pv_estimate": 2.0, "pv_estimate10": 1.5, "pv_estimate90": 2.5, "pv_estimateCL": 1.0},
+            ]
+            # now_utc_exact is the wall clock on the real component, so pin it to the mock's 12:00 or
+            # no slot covers "now" and every power-now figure is 0
+            with test_api.patch_now_utc_exact():
+                test_api.solar.publish_pv_stats(pv_forecast_data, divide_by=1.0, period=30)
+
+            published = test_api.dashboard_items
+            if uncalibrated_entity not in published:
+                print("ERROR: {} was not published with calibration {}".format(uncalibrated_entity, "on" if calibration_on else "off"))
+                failed = True
+                continue
+
+            state = published[uncalibrated_entity]["state"]
+            if abs(state - 4.0) > 0.01:
+                print("ERROR: {} state {} with calibration {}, expected the raw 4.0 kW".format(uncalibrated_entity, state, "on" if calibration_on else "off"))
+                failed = True
+
+            now_attribute = published[h0_entity]["attributes"]["now"]
+            if abs(state - now_attribute) > 0.001:
+                print("ERROR: {} state {} disagrees with the h0 'now' attribute {} with calibration {}".format(uncalibrated_entity, state, now_attribute, "on" if calibration_on else "off"))
+                failed = True
         finally:
             test_api.cleanup()
 
@@ -4951,6 +5542,7 @@ def run_solcast_tests(my_predbat):
 
     # Publish stats tests
     failed |= test_publish_pv_stats(my_predbat)
+    failed |= test_publish_pv_stats_ignores_stale_shared_midnight(my_predbat)
     failed |= test_publish_pv_stats_remaining_calculation(my_predbat)
     failed |= test_publish_pv_stats_missing_day_zero(my_predbat)
 
@@ -4989,6 +5581,7 @@ def run_solcast_tests(my_predbat):
     failed |= test_fetch_pv_forecast_solcast_direct_15min_slots(my_predbat)
     failed |= test_fetch_pv_forecast_open_meteo_first_hourly_slots(my_predbat)
     failed |= test_fetch_pv_forecast_ha_sensors_unit_factor_unchanged(my_predbat)
+    failed |= test_fetch_pv_forecast_ha_sensors_invalid_factor_still_warns(my_predbat)
 
     # Calibration tests
     failed |= test_pv_calibration_power_conversion(my_predbat)
@@ -5006,6 +5599,13 @@ def run_solcast_tests(my_predbat):
     failed |= test_pv_calibration_raw_exceeds_ceiling_warns(my_predbat)
     failed |= test_pv_calibration_raw_within_ceiling_no_warning(my_predbat)
     failed |= test_pv_calibration_partial_history(my_predbat)
+    failed |= test_pv_calibration_learns_from_raw_forecast(my_predbat)
+    failed |= test_pv_calibration_learns_from_mixed_upgrade_history(my_predbat)
+    failed |= test_pv_calibration_prefers_uncalibrated_sensor(my_predbat)
+    failed |= test_pv_calibration_scales_uncalibrated_history_by_pv_scaling(my_predbat)
+    failed |= test_pv_calibration_fills_uncalibrated_cutover_from_h0(my_predbat)
+    failed |= test_pv_forecast_history_fetches_h0_only_when_needed(my_predbat)
+    failed |= test_publish_pv_stats_publishes_uncalibrated_forecast(my_predbat)
     failed |= test_pv_calibration_synthetic_values(my_predbat)
     failed |= test_pv_calibration_average_day_scaling_ratio_of_sums(my_predbat)
     failed |= test_pv_calibration_total_adjustment_recency_weighted(my_predbat)
