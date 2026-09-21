@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, AsyncMock
 
 from tests.test_infra import create_aiohttp_mock_response, create_aiohttp_mock_session, run_async
-from teslemetry import TeslemetryAPI, OPERATION_MODES, OPTIONS_TIME_FULL, DEFAULT_SCHEDULE
+from teslemetry import TeslemetryAPI, OPERATION_MODES, OPTIONS_TIME_FULL, DEFAULT_SCHEDULE, FORCED_ASSERT_SECONDS
 
 
 class FakeStorage:
@@ -45,6 +45,7 @@ class MockTeslemetryAPI(TeslemetryAPI):
         self.api_auth_failed = False
         self.last_live_poll = 0
         self.last_energy_poll = 0
+        self._last_forced_assert = 0
         self.site_info_done = False
         self.last_soc = None
         self.soc_max_real = False
@@ -129,6 +130,10 @@ class MockTeslemetryAPI(TeslemetryAPI):
 def _rate_base(import_p, export_p):
     """A minimal base double exposing flat import/export rate dicts and a local clock for build_tariff.
 
+    now_utc, not now: Predbat keeps one clock, in the configured timezone, and _local_today_weekday
+    reads it. A double that carries the wrong name still "works" - the helper falls back to the live
+    wall clock - so the name matters here.
+
     get_arg's keyword-only "d" never matches the "default=" keyword ComponentBase.get_arg forwards
     with, so it always falls through to its own None default (never the caller's default) - which
     reads as not read-only since bool(None) is False. This matches how
@@ -140,7 +145,7 @@ def _rate_base(import_p, export_p):
 
     rate_import = {m: import_p for m in range(0, 2880)}
     rate_export = {m: export_p for m in range(0, 2880)}
-    return SimpleNamespace(rate_import=rate_import, rate_export=rate_export, minutes_now=0, now=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
+    return SimpleNamespace(rate_import=rate_import, rate_export=rate_export, minutes_now=0, now_utc=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
 
 
 LIVE_STATUS = {
@@ -632,7 +637,7 @@ def test_teslemetry_build_tariff_boost_is_strict_max_on_today_dow():
     # Absolute, independent expectation (GH#4610): Tesla's fromDayOfWeek uses Monday=0, the same
     # convention as plain datetime.weekday() - deliberately NOT routed through _tesla_dow, the
     # function under test, so a wrong mapping there cannot make this assertion trivially pass.
-    today_dow = api.base.now.weekday()
+    today_dow = api.base.now_utc.weekday()
     assert set(p["fromDayOfWeek"] for p in sell_periods["ON_PEAK"]["periods"]) == {today_dow}
     boost = tariff["sell_tariff"]["energy_charges"]["AllYear"]["rates"]["ON_PEAK"]
     real = [v for t, v in tariff["sell_tariff"]["energy_charges"]["AllYear"]["rates"].items() if t != "ON_PEAK"]
@@ -684,7 +689,7 @@ def test_teslemetry_build_tariff_export_window_ending_at_midnight_spares_tomorro
     api = MockTeslemetryAPI()
     api.base = _rate_base(import_p=28.0, export_p=15.0)
     tariff = api.build_tariff((1380, 0), now_min=600)  # 23:00 -> 00:00, now 10:00
-    today_dow = api.base.now.weekday()
+    today_dow = api.base.now_utc.weekday()
     tomorrow_dow = (today_dow + 1) % 7
     for tou_periods in (tariff["seasons"]["AllYear"]["tou_periods"], tariff["sell_tariff"]["seasons"]["AllYear"]["tou_periods"]):
         boost_days = {day for day in range(7) for p in tou_periods.get("ON_PEAK", {"periods": []})["periods"] if p["fromDayOfWeek"] <= day <= p["toDayOfWeek"]}
@@ -740,7 +745,7 @@ def test_teslemetry_saving_session_spike_keeps_daily_shape():
         rate_export[minute] = 175.0
 
     api = MockTeslemetryAPI()
-    api.base = SimpleNamespace(rate_import={m: 15.0 for m in range(2880)}, rate_export=rate_export, minutes_now=0, now=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
+    api.base = SimpleNamespace(rate_import={m: 15.0 for m in range(2880)}, rate_export=rate_export, minutes_now=0, now_utc=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
     # Predbat scheduled an export over the session, so build_tariff is called with that window.
     tariff = api.build_tariff((17 * 60, 18 * 60 + 30), now_min=12 * 60)
     sell = tariff["sell_tariff"]["energy_charges"]["AllYear"]["rates"]
@@ -782,7 +787,7 @@ def test_teslemetry_quantise_in_range_excluded_price_no_keyerror():
         rate_export[minute] = 15.0
 
     api = MockTeslemetryAPI()
-    api.base = SimpleNamespace(rate_import={m: 15.0 for m in range(2880)}, rate_export=rate_export, minutes_now=0, now=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
+    api.base = SimpleNamespace(rate_import={m: 15.0 for m in range(2880)}, rate_export=rate_export, minutes_now=0, now_utc=datetime(2026, 7, 20, 12, 0), local_tz=None, get_arg=lambda a, d=None, **k: d)
     tariff = api.build_tariff((17 * 60, 17 * 60 + 30), now_min=12 * 60)  # must not raise
     sell = tariff["sell_tariff"]["energy_charges"]["AllYear"]["rates"]
     periods = tariff["sell_tariff"]["seasons"]["AllYear"]["tou_periods"]
@@ -896,7 +901,7 @@ def test_teslemetry_signal_tariff_is_independent_of_the_clock_and_rates():
     api = MockTeslemetryAPI()
     api.base = _rate_base(import_p=28.0, export_p=15.0)
     first = json.dumps(api.build_signal_tariff((120, 300), (1020, 1140)), sort_keys=True)
-    api.base.now = datetime(2026, 7, 23, 3, 30)  # different weekday and time of day
+    api.base.now_utc = datetime(2026, 7, 23, 3, 30)  # different weekday and time of day
     api.base.rate_import = {minute: 9.0 for minute in range(0, 2880)}  # and different real rates
     second = json.dumps(api.build_signal_tariff((120, 300), (1020, 1140)), sort_keys=True)
     assert first == second
@@ -1312,6 +1317,73 @@ def test_teslemetry_dedupe_failed_post_not_cached_so_retries():
     posts = [req for req in api.requests_made if req[0] == "POST"]
     assert len(posts) == 2
     assert api.entity_states["select.predbat_teslemetry_operation_mode"] == "backup"
+
+
+def _make_forced_assert_api():
+    """Build a run()-driveable API whose control branch is reachable, for the forced re-assert tests."""
+    api = MockTeslemetryAPI()
+    api.base = _rate_base(import_p=28.0, export_p=15.0)
+    api.base.get_arg = lambda a, d=None, **k: d  # not read-only
+    api.mock_responses["/api/1/products"] = {"response": [{"energy_site_id": 123456}]}
+    api.mock_responses["/api/1/energy_sites/123456/site_info"] = SITE_INFO
+    api.mock_responses["/api/1/energy_sites/123456/live_status"] = LIVE_STATUS
+    api.mock_responses["/api/1/energy_sites/123456/calendar_history?kind=energy&period=day"] = ENERGY_HISTORY
+    for path in ("operation", "backup", "grid_import_export", "time_of_use_settings"):
+        api.mock_responses["/api/1/energy_sites/123456/" + path] = {"response": {"code": 201}}
+    return api
+
+
+def _control_posts(api):
+    """Return the device-tuple POSTs made so far (the tariff push is not part of the asserted tuple)."""
+    return [req[1].rsplit("/", 1)[-1] for req in api.requests_made if req[0] == "POST" and not req[1].endswith("/time_of_use_settings")]
+
+
+def test_teslemetry_forced_assert_resends_unchanged_tuple_after_interval():
+    """An unchanged desired tuple is deduped away every cycle until FORCED_ASSERT_SECONDS, then re-sent in full.
+
+    This is the GH#5157 stall: a Powerwall silently stops honouring a standing state while still
+    reading it back correctly, so nothing detects the drift and the transition-based self-heal never
+    fires. The periodic forced re-assert is the only correction, so it must actually re-POST the
+    whole tuple rather than being skipped by the write-on-change cache.
+    """
+    api = _make_forced_assert_api()
+    run_async(api.run(seconds=0, first=True))
+    assert _control_posts(api), "boot cycle should assert the tuple onto the device"
+    # Steady state: the desired tuple never changes, so every cycle short of the interval is deduped away.
+    api.requests_made.clear()
+    for seconds in range(60, FORCED_ASSERT_SECONDS, 60):
+        run_async(api.run(seconds=seconds, first=False))
+    assert _control_posts(api) == [], "an unchanged tuple must not cost commands before the forced re-assert is due"
+    # Interval reached: the full tuple is re-asserted despite nothing having changed.
+    run_async(api.run(seconds=FORCED_ASSERT_SECONDS, first=False))
+    assert sorted(_control_posts(api)) == ["backup", "grid_import_export", "operation"]
+    assert api._last_forced_assert == FORCED_ASSERT_SECONDS
+    # ...and the timer resets, so the next cycle is deduped again rather than re-sending every cycle.
+    api.requests_made.clear()
+    run_async(api.run(seconds=FORCED_ASSERT_SECONDS + 60, first=False))
+    assert _control_posts(api) == []
+
+
+def test_teslemetry_forced_assert_failure_retries_next_cycle():
+    """A forced re-assert that fails must not advance the timer, so it retries next cycle rather than waiting another interval.
+
+    This is _apply_command's failure-retry invariant carried up to the forced assert: the dedupe cache
+    is only refreshed on a confirmed send, and the forced-assert timer must behave the same way.
+    """
+    api = _make_forced_assert_api()
+    run_async(api.run(seconds=0, first=True))
+    # Break the /operation endpoint so the forced assert cannot complete (returns None -> command fails).
+    del api.mock_responses["/api/1/energy_sites/123456/operation"]
+    api.requests_made.clear()
+    run_async(api.run(seconds=FORCED_ASSERT_SECONDS, first=False))
+    assert "operation" in _control_posts(api)
+    assert api._last_forced_assert == 0, "a failed forced assert must not advance the timer"
+    # Next cycle retries immediately instead of waiting another FORCED_ASSERT_SECONDS.
+    api.mock_responses["/api/1/energy_sites/123456/operation"] = {"response": {"code": 201}}
+    api.requests_made.clear()
+    run_async(api.run(seconds=FORCED_ASSERT_SECONDS + 60, first=False))
+    assert "operation" in _control_posts(api)
+    assert api._last_forced_assert == FORCED_ASSERT_SECONDS + 60
 
 
 def test_teslemetry_dedupe_tariff_identical_body_skips_repeat_post():
@@ -2348,6 +2420,28 @@ def test_teslemetry_quantise_agile_three_bands_clamped_rounded():
     assert len(today) == 48 and len(tomorrow) == 48
 
 
+def test_teslemetry_local_weekday_follows_the_base_clock():
+    """The tariff weekday comes from Predbat's clock, not the machine's.
+
+    _local_today_weekday() falls back to the live wall clock when the base has no clock, which is
+    what makes this worth pinning: it read base.now until Predbat's second, host-timezone clock was
+    removed, and the fallback meant the rename showed up as a silently different weekday - ignoring
+    clock_skew and any pinned clock - rather than an error. The pinned date below is a Thursday, so
+    a fallback to the real clock fails this on six days out of seven.
+    """
+    from datetime import datetime
+
+    api = MockTeslemetryAPI()
+    api.base = _rate_base(import_p=28.0, export_p=15.0)
+    api.base.now_utc = datetime(2026, 7, 23, 3, 30)  # a Thursday
+
+    assert api._local_today_weekday() == 3, f"Expected Thursday (3), got {api._local_today_weekday()}"
+
+    # No base at all: the live clock, rather than an exception.
+    api.base = None
+    assert api._local_today_weekday() == datetime.now().weekday()
+
+
 def test_teslemetry_tesla_dow_matches_python_weekday():
     """Tesla's tariff_content_v2 fromDayOfWeek/toDayOfWeek use Monday=0..Sunday=6, the same convention
     as datetime.weekday() (GH#4610) - so _tesla_dow must be the identity function. The previous
@@ -2372,7 +2466,7 @@ def test_teslemetry_build_tariff_boost_resolves_at_the_real_tesla_day_index():
     sell = tariff["sell_tariff"]["energy_charges"]["AllYear"]["rates"]
     periods = tariff["sell_tariff"]["seasons"]["AllYear"]["tou_periods"]
 
-    real_dow = api.base.now.weekday()  # Tesla's actual day index for "today" - independent of _tesla_dow
+    real_dow = api.base.now_utc.weekday()  # Tesla's actual day index for "today" - independent of _tesla_dow
     minute = 17 * 60 + 30  # inside the window
 
     def resolve_tiers(dow, minute):
@@ -2645,6 +2739,8 @@ def test_teslemetry(my_predbat=None):
     test_teslemetry_dedupe_operation_mode_skips_repeat_post()
     test_teslemetry_dedupe_operation_mode_resends_on_change()
     test_teslemetry_dedupe_failed_post_not_cached_so_retries()
+    test_teslemetry_forced_assert_resends_unchanged_tuple_after_interval()
+    test_teslemetry_forced_assert_failure_retries_next_cycle()
     test_teslemetry_dedupe_tariff_identical_body_skips_repeat_post()
     test_teslemetry_dedupe_tariff_resends_when_rates_change()
     test_teslemetry_drift_correction_refreshes_cache_and_reasserts()
@@ -2706,6 +2802,7 @@ def test_teslemetry(my_predbat=None):
     test_teslemetry_quantise_two_distinct_exact()
     test_teslemetry_quantise_agile_three_bands_clamped_rounded()
     test_teslemetry_tesla_dow_matches_python_weekday()
+    test_teslemetry_local_weekday_follows_the_base_clock()
     test_teslemetry_build_tariff_boost_resolves_at_the_real_tesla_day_index()
     test_teslemetry_boost_price_floor_wins_on_low_rates()
     test_teslemetry_side_layout_partitions_every_day()

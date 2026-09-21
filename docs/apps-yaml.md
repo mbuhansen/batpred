@@ -236,6 +236,32 @@ If a secret is referenced in `apps.yaml` but not found in `secrets.yaml`, Predba
 - All secrets stored in one centralized location
 - Compatible with Home Assistant's secrets system
 
+### Redaction in logs and debug files
+
+Credential values - whether stored in `secrets.yaml` and referenced with `!secret`, or written directly in `apps.yaml` - are masked wherever Predbat writes them out: `predbat.log`, a `predbat_debug_*.yaml` file, and the apps.yaml downloads on the [web interface](web-interface.md). This happens at the point each line is written, not only when a file is later downloaded, so the on-disk files themselves never carry the plaintext value - including if you copy `predbat.log` directly off a Samba share rather than downloading it through Predbat.
+
+A masked value appears with a label naming which credential it was, e.g. `<octopus_api_key>`, rather than a generic placeholder, so a log line stays useful for diagnosing a problem without ever showing the value itself.
+
+#### redact_strings and redact_strings_labelled
+
+Predbat can only recognise a value as a credential by its `apps.yaml` key name (`_key`, `password`, `secret`, `token`) or from the list of account/meter/serial-number-style identifiers it knows about internally. It has no way to know that a value coming from a third-party Home Assistant integration - an MPAN embedded in a sensor's `entity_id` or attributes, say - is sensitive. For anything like that, list the value yourself, preferably with `redact_strings_labelled` - a name -> value mapping, so the masked line reads with your own label instead of a generic one:
+
+```yaml
+pred_bat:
+  redact_strings_labelled:
+    my_mpan: "1234567890123"  # e.g. an MPAN surfaced by a third-party integration
+```
+
+That masks as `<my_mpan>` wherever it appears. If you don't need a label, `redact_strings` is a bare list instead:
+
+```yaml
+pred_bat:
+  redact_strings:
+    - "1234567890123"
+```
+
+Each entry there is masked generically as `<redact_strings>`. As with any other credential, you can reference a `!secret` here too rather than writing the value inline. Both settings are themselves masked wholesale if they ever appear in a debug dump, so the denylist doesn't leak the very values (or, for the labelled form, the label names) it exists to hide.
+
 ## Basics
 
 Basic configuration items
@@ -323,6 +349,25 @@ Valid values are:
 
 ```yaml
   threads: auto
+```
+
+### log_count
+
+Sets how many Predbat log files to keep, including the live `predbat.log`. The default is 10, so
+`predbat.log` plus nine rotated copies. Valid values are 2 to 100.
+
+Predbat rotates the log when it reaches 10MB: `predbat.log` becomes `predbat.01.log`, the old
+`predbat.01.log` becomes `predbat.02.log`, and so on, with anything past `log_count` deleted.
+Raising this keeps more history at the cost of disk space - each file can reach 10MB, so
+`log_count: 100` can use around 1GB.
+
+Rotated logs are numbered with two digits (`predbat.01.log` through `predbat.99.log`) so that a
+directory listing sorts them in rotation order. Older Predbat versions used single digits
+(`predbat.1.log`); those files are still read, and are renamed to the two-digit form as they
+rotate, so nothing is lost on upgrade and no manual clean-up is needed.
+
+```yaml
+  log_count: 10
 ```
 
 ### enable_coarse_fine_levels
@@ -744,7 +789,7 @@ Add the following to your `apps.yaml` to configure the Solis Cloud integration:
 - `solis_control_enable` - Enable/disable control commands (default: `true`, set to `false` for monitoring only)
 - `solis_cloud_pv_load_ignore` - Optional, defaults to false. When set to `true`, Predbat will override the **solis_automatic** setting and use the **load_today**, **load_power**, **pv_today** and **pv_load** sensors configured in `apps.yaml`.<BR>
 This can be useful if the Solis cloud data in the does not accurately reflect your house PV and load (e.g. multiple inverters that share load or PV inverter and micro-inverters) and you want to use a custom sensors.  All other sensors will use either the `apps.yaml` entries or the Solis Cloud entities depending upon **solis_automatic**.
-- `solis_nominal_voltage` - Optional, your battery's nominal pack voltage (e.g. cell count x nominal cell voltage per cell - **not** the live/resting battery voltage reported by the inverter, which varies with charge state). Only used to compute the `battery_capacity` sensor; the max charge/discharge power sensors and `battery_rate_max` use the live measured voltage automatically and don't need this set. Without it, `battery_capacity` is still published but estimated from the live measured voltage instead, and flagged unreliable (a `reliable: false` attribute, plus a log warning) since that value drifts with charge state - set this option for an accurate, stable figure. `soc_max` must still be set manually either way (see below), the `battery_capacity` sensor is informational only and is not auto-bound to it.
+- `solis_nominal_voltage` - Optional, your battery's nominal pack voltage (e.g. cell count x nominal cell voltage per cell - **not** the live/resting battery voltage reported by the inverter, which varies with charge state). The inverter stores its charge and discharge limits as currents, so this is the voltage Predbat uses to convert them to watts: it sets the `battery_capacity` sensor, the max charge/discharge power and slot power sensors, and hence `battery_rate_max`. Without it, Predbat infers the voltage instead: on an LV pack it classifies the pack from the BMS-requested charge voltage the inverter reports (48V below 55V, 51.2V at or above it), and on an HV pack it continues to use the live reading. The LV result is fixed across polls, so nothing drifts as the battery charges and discharges, but it is an inference rather than a stated figure, so `battery_capacity` is flagged unreliable (a `reliable: false` attribute, plus a log warning). Set this option for an accurate figure - and note that on an HV pack it is the only way to stop the derived watt values moving with state of charge. `soc_max` must still be set manually either way (see below), the `battery_capacity` sensor is informational only and is not auto-bound to it.
 
 #### Important notes (Solis)
 
@@ -1324,7 +1369,7 @@ If this setting is `false` then the inverter will not charge the battery and the
 
 For Freeze Export specifically, this means that during a solar surplus the battery still holds its SoC flat while the export limit alone can absorb all that surplus - it only starts charging once solar genuinely exceeds what load and the export limit together can use.
 
-Freeze Export recapture also depends on your inverter type, not just this setting. Most inverters implement Freeze Export by simply disabling charging, so PV beyond the export limit really is clipped and lost; only inverters with a genuine "Feed-in First" mode - which prioritises house load, then export, then the battery - recapture it. Today that means FoxESS and FoxCloud, plus the four cloud integrations that switch the inverter into an export-first work mode for the freeze: SolisCloud ("Feed-in priority"), SolaxCloud ("Feed-in"), SunsynkCloud and DeyeCloud (both "Selling First"). Predbat knows which is which from your inverter type and models the two differently, so setting `inverter_can_charge_during_export` to `true` will not make a non-Feed-in-First inverter charge during Freeze Export. Force Export is unaffected and is still controlled by this setting alone.
+Freeze Export recapture also depends on your inverter type, not just this setting. Most inverters implement Freeze Export by simply disabling charging, so PV beyond the export limit really is clipped and lost; only inverters with a genuine "Feed-in First" mode - which prioritises house load, then export, then the battery - recapture it. Today that means FoxESS, plus the five cloud integrations that switch the inverter into an export-first work mode for the freeze: FoxCloud ("Feedin", written into the scheduler slots Predbat already programmes), SolisCloud ("Feed-in priority"), SolaxCloud ("Feed-in"), SunsynkCloud and DeyeCloud (both "Selling First"). Predbat knows which is which from your inverter type and models the two differently, so setting `inverter_can_charge_during_export` to `true` will not make a non-Feed-in-First inverter charge during Freeze Export. Force Export is unaffected and is still controlled by this setting alone.
 
 ### **inverter_freeze_export_discharge_rate**
 
@@ -1389,6 +1434,10 @@ If not set or set to 0, Predbat will attempt to automatically determine the batt
 This requires at least several days of historical data with charging periods of 15% or more SoC change. If automatic detection fails, you must manually set this value.
 - **battery_min_soc** - When set limits the target SoC% setting for charge and discharge to a minimum percentage value
 - **reserve** - sensor name for the reserve SoC % setting. The reserve SoC is the lower limit target % to discharge the battery down to.
+Can also be set to a fixed percentage rather than an entity name for inverters that have no reserve register to point at -
+the supplied Huawei and Sofar templates do this. A fixed value tells Predbat what the inverter is set to so it can be modelled,
+but Predbat cannot then change the reserve, so `switch.predbat_set_reserve_enable` has nothing to write to and Predbat logs a
+warning if something tries. This is true of any setting given a fixed value in place of an entity name.
 - **battery_temperature** - Defined the temperature of the battery in degrees C (default is 20 if not set).
 - **givtcp_battery_dod** - Optional depth of discharge for a GivTCP (REST) battery, one per inverter, default 1.0.
 GivTCP does not report DoD, so set this if your battery cannot use its full nameplate capacity (e.g. 0.8 for an 80% DoD
@@ -1586,6 +1635,11 @@ With **givtcp_rest** set, Predbat reads the GivTCP REST API itself and publishes
 entities (`sensor.predbat_givtcp_0_*` and friends), then points its own settings at them - including
 **inverter_type**, **num_inverters**, the control entities, and the daily energy totals **load_today**,
 **import_today**, **export_today** and **pv_today**. You do not need to configure any of those by hand.
+
+If part of your fleet is not on GivTCP - another vendor's inverter, or one you configure by hand -
+keep **num_inverters** in `apps.yaml` set to the size of the whole fleet. Auto-configuration only ever
+raises it, never lowers it: the inverters that answered on GivTCP take the first slots, and whatever you
+configured for the inverters after them is left as you wrote it.
 
 The four daily energy totals are the one exception to auto-configuration winning: if you name a sensor
 of your own for **load_today**, **import_today**, **export_today** or **pv_today** in `apps.yaml`,
@@ -2063,9 +2117,11 @@ no hub, use the serial of the device acting as one, which is the Zappi or Eddi t
 - **myenergi_token_hash** - OAuth refresh token hash, used to refresh `myenergi_key` automatically - at least one of `myenergi_key` or `myenergi_token_hash` is required when `myenergi_auth_method` is `oauth`
 - **myenergi_token_expires_at** - OAuth access token expiry, used to trigger a refresh
 - **myenergi_automatic** - Set to `false` to stop Predbat wiring the device sensors into **car_charging_energy**, **car_charging_planned** and **iboost_energy_today** automatically (default: `true`)
+- **myenergi_automatic_zappi** - Set to `false` to wire only the Eddi half of the automatic configuration, leaving your Zappis out of **car_charging_energy**, **car_charging_planned** and **car_charging_power** (default: `true`). This is what to use if you have an Eddi but charge your car with a different make of charger - turning **myenergi_automatic** off instead would drop the **iboost_energy_today** wiring too
+- **myenergi_automatic_eddi** - Set to `false` to wire only the Zappi half of the automatic configuration, leaving your Eddi out of **iboost_energy_today** (default: `true`). This is what to use if your hot water diversion is handled elsewhere but you still want your Zappis wired as cars
 - **myenergi_enable_controls** - Set to `false` for monitor-only operation (default: `true`)
 - **myenergi_poll_seconds** - Poll interval in seconds, rounded to the nearest whole multiple of 60, minimum 60 and maximum 1800 (default: `60`)
-- **myenergi_zappi_control** - Set to `true` to let Predbat drive your Zappi from its car charging plan: Fast inside a planned charging window, Stopped outside one (default: `false`). Needs **myenergi_automatic** and **myenergi_enable_controls**, since it is automatic configuration that maps each Zappi to a car. A `switch.predbat_myenergi_zappi_control` entity appears when this is set, on by default, so you can hand the Zappi back without editing apps.yaml; releasing restores the mode the Zappi had before Predbat took over, or Eco+ when nothing was saved. Note the manual boost switch will refuse while control is on, as myenergi only accepts a boost in Eco or Eco+.
+- **myenergi_zappi_control** - Set to `true` to let Predbat drive your Zappi from its car charging plan: Fast inside a planned charging window, Stopped outside one (default: `false`). Needs **myenergi_automatic**, **myenergi_automatic_zappi** and **myenergi_enable_controls**, since it is automatic configuration that maps each Zappi to a car. A `switch.predbat_myenergi_zappi_control` entity appears when this is set, on by default, so you can hand the Zappi back without editing apps.yaml; releasing restores the mode the Zappi had before Predbat took over, or Eco+ when nothing was saved. Note the manual boost switch will refuse while control is on, as myenergi only accepts a boost in Eco or Eco+.
 
 The component only starts when at least one of `myenergi_api_key`, `myenergi_key` or `myenergi_token_hash` is set. That test is a plain any-of and does not look at `myenergi_auth_method`, so a credential belonging to the transport you did not select still starts the component — it then logs which setting is missing rather than failing silently.
 
@@ -2277,14 +2333,13 @@ Set **load_forecast_only** to `true` if you do not wish to use the Predbat forec
 When you have two or more inverters it's possible they get out of sync so they are at different charge levels or they start to cross-charge (one discharges into another).
 When enabled, balance inverters try to recover this situation by disabling either charging or discharging from one of the batteries until they re-align.
 
-Most of the Predbat configuration for balancing inverters is through a number of [Home Assistant controls for Balancing Inverters](customisation.md#balance-inverters),
-but there is one configuration item in `apps.yaml`:
+The Predbat configuration for balancing inverters is entirely through the
+[Home Assistant controls for Balancing Inverters](customisation.md#balance-inverters); there is nothing to set
+in `apps.yaml`.
 
-```yaml
-  balance_inverters_seconds: seconds
-```
-
-Defines how often to run the inverter balancing, 30 seconds is recommended if your machine is fast enough, but the default is 60 seconds.
+Balancing used to have its own `balance_inverters_seconds` interval. It now runs as part of Predbat's normal
+control cycle, so that setting has been removed - if it is still present in your `apps.yaml` it is ignored and
+can be deleted.
 
 ## Config validation retries
 
@@ -2351,6 +2406,14 @@ Skews the setting of the charge slot registers vs the predicted start time
 ```
 
 Skews the setting of the discharge slot registers vs the predicted start time
+
+Predbat compares the inverter's own clock against the computer clock on every update and reports the result in the log
+(`Inverter time ..., Predbat computer time ..., difference N minutes`). None of the `inverter_clock_skew_*` settings are
+applied automatically, so if that difference is 5 minutes or more Predbat also logs a `Warn:` line, repeated at most once
+an hour per inverter, reminding you to correct the inverter clock or to compensate for it with the settings above.
+At 30 minutes or more the warning becomes an error and Predbat will trigger your `auto_restart` commands if configured.
+An uncorrected skew shifts the start and end of every charge and export slot Predbat writes, which typically shows up as
+unexpected grid import at the edges of each window.
 
 ### Battery size scaling
 

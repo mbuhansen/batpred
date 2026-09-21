@@ -8,7 +8,9 @@ allowed-tools: You can read anything in this repo and the queue directory, but y
 
 You maintain `tools/debug-journal.md` — the file every triage, PR-review and PR-cleanup run reads before forming a hypothesis. Each of those runs can leave a finding in a queue directory; once a day you fold the queue in and open a PR.
 
-Arguments: `queue=<dir>`. Every `*.md` directly in that directory is one candidate. `<queue>/processed/` is the archive of candidates already folded in — read it for context if you like, but never treat it as new input.
+Arguments: `queue=<dir> limit=<n>`. Every `*.md` directly in that directory is one candidate. `<queue>/processed/` is the archive of candidates already folded in — read it for context if you like, but never treat it as new input.
+
+**Take only the first `limit` candidates, in plain filename sort order, and leave the rest alone.** The daemon archives exactly that slice once your PR is open, so folding in a different set means the ones you skipped get archived unread while the ones you added get offered again tomorrow. A backlog is normal and drains a slice per day; it is not a reason to reach past the limit. Say in the PR body how many were left queued.
 
 **The journal being wrong is worse than it being stale.** Every later run trusts it, so a confidently wrong entry propagates into comments posted to real reporters. One entry recently asserted a credential leak that had already been fixed; left alone it would have had a triage run tell a reporter to rotate keys that never leaked. Your job is as much deleting and correcting as adding.
 
@@ -58,17 +60,22 @@ New vendor and firmware terms will fail the cspell hook. Add genuine terms to `.
 
 Docs-only changes still have to pass cspell and markdownlint. Do not skip it.
 
-## 6. Commit and open the PR
+## 6. Commit, push, and write the PR body
 
 ```bash
 git checkout -b bot/debug-journal-<YYYY-MM-DD>
 git add tools/debug-journal.md .cspell/custom-dictionary-workspace.txt
 git commit -m "docs(debug-journal): <what changed>"
 git push -u origin bot/debug-journal-<YYYY-MM-DD>
-gh pr create --draft --title "..." --body-file <path>
 ```
 
-The PR body must open with a line disclosing it is automated, then list, per candidate, what you folded in, rewrote or dropped **and why** — that list is what makes the PR reviewable in a couple of minutes instead of requiring a full re-read of the diff. Name every existing entry you corrected separately, with the merge that invalidated it.
+**You do not open the pull request — the daemon opens it as soon as it sees the branch.** You write its body, by editing `journal-pr-body.md` in the scratch directory your prompt puts in scope, replacing the placeholder line with the whole body.
+
+Use the Edit tool for that, not a shell command. Tool parameters carry newlines and quoting without any escaping to get wrong, whereas a body assembled in the shell has to survive both the permission matcher and your own quoting — which is how an earlier flush ended up shipping a one-line body promising a per-candidate list that never arrived (PR #5011). Writing the file also means the daemon can open the PR even if this step is skipped.
+
+The body must open with a line disclosing it is automated, then list, per candidate, what you folded in, rewrote or dropped **and why** — that list is what makes the PR reviewable in a couple of minutes instead of requiring a full re-read of the diff. Name every existing entry you corrected separately, with the merge that invalidated it.
+
+If you leave the placeholder alone the PR still opens, with a stub body pointing at the run log, so the work is never lost — but the review is far harder. Write the body.
 
 Do not merge it. A human merge is the review gate on this file.
 

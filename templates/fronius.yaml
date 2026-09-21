@@ -84,7 +84,6 @@ pred_bat:
     soc_units: "%"
     num_load_entities: 1
     has_ge_inverter_mode: false
-    has_fox_inverter_mode: false
     time_button_press: false
     clock_time_format: "%d-%m-%y %H:%M:%S"
     write_and_poll_sleep: 2
@@ -93,8 +92,6 @@ pred_bat:
     support_discharge_freeze: true
 
   #
-  # Run balance inverters every N seconds (0=disabled) - only for multi-inverter
-  balance_inverters_seconds: 0
 
   # Services to control charging/discharging
   # Each service sets one mode ON and all others OFF for clean state transitions.
