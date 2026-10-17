@@ -59,7 +59,7 @@ class Marginal:
                 modified_load[minute] += amount
 
         # No need to include 10% extra load as we only run normal simulations.
-        pred = Prediction(self, self.pv_forecast_minute_step, self.pv_forecast_minute_step, modified_load, modified_load, kernel_static_cache=kernel_static_cache)
+        pred = Prediction(self, self.pv_forecast_minute_step, self.pv_forecast_minute_step, modified_load, modified_load, kernel_static_cache=kernel_static_cache, car_charging_slots=self.car_charging_slots_model())
         (new_metric, _import_battery, _import_house, _export, _soc_min, final_soc, _soc_min_minute, _cycle, _metric_keep, final_iboost, *_) = pred.run_prediction(
             self.charge_limit_best,
             self.charge_window_best,
