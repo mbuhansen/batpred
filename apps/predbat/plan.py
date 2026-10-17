@@ -21,6 +21,8 @@ call to the C++ prediction kernel, which is where the threading now lives.
 from datetime import datetime, timedelta, timezone
 from multiprocessing import cpu_count
 from const import (
+    CAR_BATTERY_EARLY_MINUTES,
+    CAR_BATTERY_EARLY_TOLERANCE,
     CAR_SCORE_MAX_WINDOWS,
     CLOUD_FACTOR_PV10,
     CLOUD_WINDOW_MINUTES,
@@ -2402,9 +2404,8 @@ class Plan:
                 # Compute marginal energy cost matrix (what-if extra load scenarios)
                 self.calculate_marginal_costs()
 
-                # Measure whether pricing the car's windows against the forecast would choose differently
-                # than the import-rate sort did - diagnostic only, the plan is not changed
-                self.log_car_window_scoring()
+                # Move car charge the battery would supply anyway forward to now, where that costs nothing
+                self.plan_car_battery_early()
 
                 # HTML data
                 text = self.short_textual_plan(soc_min, soc_min_minute, pv_forecast_minute_step, pv_forecast_minute10_step, load_minutes_step, load_minutes_step10, self.end_record)
@@ -5981,148 +5982,186 @@ class Plan:
         plan = self.sort_window_by_time(plan)
         return plan
 
-    def car_window_load_delta(self, car_n, window, ready_minutes):
-        """Return the load forecast delta a car charging in this window would add, or None.
+    def car_battery_early_blocked(self, car_n, slots):
+        """Return why this car may not charge early from the battery right now, or None if it may.
 
-        Keys are minutes relative to now on the PREDICT_STEP grid, matching load_minutes_step; the value
-        is the grid-side draw in that step. Mirrors what plan_car_charging would book for the window -
-        the charging rate over its length, clipped to the ready time and to what the car still needs.
+        These are the hard rules, checked before anything is scored: the feature is on, the car has a plan of
+        Predbat's own (an Octopus car is charged when Octopus says), and the battery is not exporting, or
+        charging or held by a charge window, at any point in the chunk - the battery does not discharge into
+        the car in a charge window, and charge sent to the car in an export window is charge not exported.
         """
-        start = max(window["start"], self.minutes_now)
-        end = min(window["end"], ready_minutes)
-        if end <= start:
-            return None
+        if not self.car_charging_battery_early or not self.car_charging_from_battery:
+            return "disabled"
+        if car_n >= len(self.car_charging_planned) or not self.car_charging_planned[car_n]:
+            return "not_planned"
+        if not slots:
+            return "no_slots"
+        if any(slot.get("octopus", False) for slot in slots):
+            return "octopus"
+        if self.isExporting:
+            return "exporting"
 
-        needed = max(self.car_charging_limit[car_n] - self.car_charging_soc[car_n], 0)
-        if needed <= 0:
-            return None
+        start = self.minutes_now
+        end = start + CAR_BATTERY_EARLY_MINUTES
+        for window_n, window in enumerate(self.export_window_best):
+            if window["start"] < end and window["end"] > start and window_n < len(self.export_limits_best) and export_mode_of(self.export_limits_best[window_n]) != EXPORT_MODE_IDLE:
+                return "export_window"
+        for window_n, window in enumerate(self.charge_window_best):
+            if window["start"] < end and window["end"] > start and window_n < len(self.charge_limit_best) and self.charge_limit_best[window_n] > 0:
+                return "charge_window"
+        return None
 
-        kwh = self.car_charging_rate[car_n] * (end - start) / 60.0
-        if self.car_charging_loss > 0:
-            kwh = min(kwh, needed / self.car_charging_loss)
-        if kwh <= 0:
-            return None
+    def car_battery_early_slots(self, car_n, slots, source_n):
+        """Return slots with a chunk of slots[source_n]'s charge moved to start now, or None if it cannot move.
 
-        extra = {}
-        kwh_per_minute = kwh / (end - start)
-        start_rel = start - self.minutes_now
-        end_rel = end - self.minutes_now
-        first = (start_rel // PREDICT_STEP) * PREDICT_STEP
-        for minute in range(first, end_rel, PREDICT_STEP):
-            covered = min(minute + PREDICT_STEP, end_rel) - max(minute, start_rel)
-            if covered > 0:
-                extra[minute] = extra.get(minute, 0.0) + kwh_per_minute * covered
-        return extra, kwh
-
-    def car_slot_load_delta(self, slot):
-        """Return the load forecast delta an already planned slot adds, keyed for score_extra_load.
-
-        Unlike car_window_load_delta this takes the energy the slot has already booked rather than working
-        it out from the charging rate, so the planned slot and a candidate window are scored on the same
-        terms - what each actually puts into the car.
+        The chunk is up to CAR_BATTERY_EARLY_MINUTES at the car's charging rate, never more than the source
+        slot holds, and the source slot is shortened by what it gave up so it keeps its charging rate. The
+        chunk is marked battery_early so the published mode can say why the car is charging.
         """
-        length = slot["end"] - slot["start"]
-        if length <= 0 or slot["kwh"] <= 0:
+        rate = self.car_charging_rate[car_n] if car_n < len(self.car_charging_rate) else 0
+        if rate <= 0 or source_n < 0 or source_n >= len(slots):
             return None
 
-        extra = {}
-        kwh_per_minute = slot["kwh"] / length
-        start_rel = slot["start"] - self.minutes_now
-        end_rel = slot["end"] - self.minutes_now
-        first = (start_rel // PREDICT_STEP) * PREDICT_STEP
-        for minute in range(first, end_rel, PREDICT_STEP):
-            covered = min(minute + PREDICT_STEP, end_rel) - max(minute, start_rel)
-            if covered > 0:
-                extra[minute] = extra.get(minute, 0.0) + kwh_per_minute * covered
-        if not extra:
+        start = self.minutes_now
+        if any(slot["start"] < start + CAR_BATTERY_EARLY_MINUTES and slot["end"] > start for slot in slots):
+            # Already charging in a planned slot, nothing to bring forward
             return None
-        return extra, slot["kwh"]
 
-    def log_car_window_scoring(self):
-        """Log what pricing the car's windows against the forecast would choose, without changing the plan.
+        source = slots[source_n]
+        if source["kwh"] <= 0 or source["end"] <= source["start"]:
+            return None
 
-        plan_car_charging orders candidate windows by import rate. With car_charging_from_battery the home
-        battery serves the car, so that rate is not what the charge costs there - what it costs is what the
-        plan gives up by having the energy leave the battery then. This measures the difference and logs it.
-        It deliberately does NOT touch car_charging_slots: the point is to find out whether the two ever
-        disagree by enough to be worth acting on, before anything acts on it.
+        kwh = min(rate * CAR_BATTERY_EARLY_MINUTES / 60.0, source["kwh"])
+        length = min(CAR_BATTERY_EARLY_MINUTES, max(PREDICT_STEP, int(-(-(kwh / rate * 60) // PREDICT_STEP)) * PREDICT_STEP))
+        rate_now = self.rate_import.get(start, 0)
+        early = {
+            "start": start,
+            "end": start + length,
+            "start_orig": start,
+            "kwh": dp3(kwh),
+            "average": dp2(rate_now),
+            "cost": dp2(rate_now * kwh),
+            "octopus": False,
+            "battery_early": True,
+        }
 
-        Called from calculate_plan after calculate_marginal_costs, which is the only place the live
-        load_minutes_step and pv_forecast_minute_step exist - fetch runs before they are built and they are
-        freed again at the end of every cycle.
+        new_slots = [early]
+        left = dp3(source["kwh"] - kwh)
+        for slot_n, slot in enumerate(slots):
+            if slot_n != source_n:
+                new_slots.append(slot)
+            elif left > 0.01:
+                old_length = slot["end"] - slot["start"]
+                new_length = min(old_length, max(PREDICT_STEP, int(-(-(old_length * left / slot["kwh"]) // PREDICT_STEP)) * PREDICT_STEP))
+                reduced = dict(slot)
+                reduced["end"] = slot["start"] + new_length
+                reduced["kwh"] = left
+                reduced["cost"] = dp2(slot["average"] * left)
+                new_slots.append(reduced)
+        return self.sort_window_by_time(new_slots)
+
+    def car_battery_early_reapply(self, car_n, slots):
+        """Keep a running early battery chunk in the plan fetch has just rebuilt, and remember that plan.
+
+        fetch rebuilds the car plan from the rates every cycle, before calculate_plan can decide again, so
+        without this the published plan would drop the chunk - and stop the charger - for the moments in
+        between. Takes the charge from the slot it came from last time, else the latest one.
         """
-        if not self.car_charging_from_battery or not self.num_cars:
-            return
-        # charge_limit_best may legitimately be empty - a plan with no charge windows is still a plan.
-        # What scoring cannot do without is the live forecast, which only exists inside calculate_plan.
-        if not self.load_minutes_step or not getattr(self, "end_record", 0):
-            return
+        self.car_battery_early_base[car_n] = slots
+        source_start = self.car_battery_early_active.get(car_n)
+        if source_start is None or self.car_battery_early_blocked(car_n, slots):
+            return slots
+        source_n = len(slots) - 1
+        for slot_n, slot in enumerate(slots):
+            if slot.get("start_orig", slot["start"]) == source_start:
+                source_n = slot_n
+                break
+        early = self.car_battery_early_slots(car_n, slots, source_n)
+        return early if early else slots
 
-        for car_n in range(self.num_cars):
-            slots = self.car_charging_slots[car_n]
-            if not slots:
-                continue
+    def car_slots_model_with(self, car_n, slots):
+        """The modelled car slots, as car_charging_slots_model() gives them, with this car's plan replaced."""
+        model = self.car_charging_slots_model()
+        now_slots = self.car_charging_now_slots[car_n] if car_n < len(self.car_charging_now_slots) else []
+        model[car_n] = list(now_slots) + list(slots)
+        return model
 
-            ready_minutes = self.car_ready_minutes(car_n)
-            candidates = [window for window in self.low_rates if window["end"] > self.minutes_now and window["start"] < ready_minutes]
-            if not candidates:
-                continue
-            candidates = candidates[:CAR_SCORE_MAX_WINDOWS]
+    def plan_car_battery_early(self):
+        """Charge the car now from the home battery where the plan would have the battery supply it later anyway.
 
-            time_start = time.time()
-            # Every context differs only in its load, so the load-independent arrays are built once
-            kernel_static_cache = {}
-            baseline = self.score_extra_load({}, kernel_static_cache=kernel_static_cache, include_battery_value=True)
-            predictions = 1
+        With car_charging_from_battery the home battery serves the car in a planned slot that is not a charge
+        window, so that part of the charge costs the same whenever it is taken - and taken now, the car has
+        the range sooner. Moving charge forward is not free in general (the battery may be needed for the
+        house before the slot, or refill at a price), so each cycle a chunk is priced with score_extra_load
+        against the plan as it stands, taken from whichever planned slot gives it up most cheaply, and kept
+        only if the plan gets at most CAR_BATTERY_EARLY_TOLERANCE per kWh dearer. The battery is never held.
 
-            best = None
-            for window in candidates:
-                delta = self.car_window_load_delta(car_n, window, ready_minutes)
-                if not delta:
-                    continue
-                extra, kwh = delta
-                metric = self.score_extra_load(extra, kernel_static_cache=kernel_static_cache, include_battery_value=True)
-                predictions += 1
-                cost = (metric - baseline) / kwh
-                if (best is None) or (cost < best[0]):
-                    best = (cost, window, kwh)
+        Called from calculate_plan after calculate_marginal_costs, the only place the live forecast exists.
+        """
+        changed = False
+        for car_n in range(min(self.num_cars, len(self.car_charging_slots))):
+            was_active = car_n in self.car_battery_early_active
+            # The plan fetch built this cycle, before any chunk - fetch only records it when it plans the car
+            base = self.car_battery_early_base.get(car_n)
+            if base is None:
+                base = [slot for slot in self.car_charging_slots[car_n] if not slot.get("battery_early", False)]
 
-            if best is None:
-                continue
+            reason = self.car_battery_early_blocked(car_n, base)
+            if not reason and (not self.load_minutes_step or not getattr(self, "end_record", 0)):
+                reason = "no_forecast"
 
-            cost, window, kwh = best
+            accepted = None
+            if not reason:
+                time_start = time.time()
+                # Every run differs in its car slots, which the kernel's static cache holds, so none is shared
+                baseline = self.score_extra_load({}, include_battery_value=True, car_charging_slots=self.car_slots_model_with(car_n, base))
+                best = None
+                for source_n in range(min(len(base), CAR_SCORE_MAX_WINDOWS)):
+                    early = self.car_battery_early_slots(car_n, base, source_n)
+                    if not early:
+                        continue
+                    kwh = next(slot["kwh"] for slot in early if slot.get("battery_early", False))
+                    metric = self.score_extra_load({}, include_battery_value=True, car_charging_slots=self.car_slots_model_with(car_n, early))
+                    cost = (metric - baseline) / kwh
+                    if best is None or cost < best[0]:
+                        best = (cost, source_n, early, kwh)
 
-            # Score the plan's own pick on the same terms. Comparing a scored price against the window's
-            # import rate would only restate that battery energy is cheaper than importing, which is true
-            # wherever the charge is put and says nothing about the placement this is trying to measure.
-            picked = slots[0]
-            picked_delta = self.car_slot_load_delta(picked)
-            if not picked_delta:
-                continue
-            picked_extra, picked_kwh = picked_delta
-            picked_cost = (self.score_extra_load(picked_extra, kernel_static_cache=kernel_static_cache, include_battery_value=True) - baseline) / picked_kwh
-            predictions += 1
+                if best is None:
+                    reason = "nothing_to_move"
+                else:
+                    cost, source_n, early, kwh = best
+                    if cost <= CAR_BATTERY_EARLY_TOLERANCE:
+                        accepted = early
+                    else:
+                        reason = "costs"
+                    self.log(
+                        "Car {} battery early: now {} {}kWh from slot {}, delta {}{}/kWh -> {} in {}s".format(
+                            car_n,
+                            self.time_abs_str(self.minutes_now),
+                            dp2(kwh),
+                            self.time_abs_str(base[source_n].get("start_orig", base[source_n]["start"])),
+                            dp2(cost),
+                            self.currency_symbols[1],
+                            "on" if accepted else "off",
+                            dp2(time.time() - time_start),
+                        )
+                    )
 
-            self.log(
-                "Car {} window scoring (diagnostic): price sort {} @{}{} scored {}{}, best {} @{}{} scored {}{}, delta {}{}/kWh over {}kWh, {} prediction(s) in {}s".format(
-                    car_n,
-                    self.time_abs_str(picked["start"]),
-                    dp2(picked["average"]),
-                    self.currency_symbols[1],
-                    dp2(picked_cost),
-                    self.currency_symbols[1],
-                    self.time_abs_str(window["start"]),
-                    dp2(window["average"]),
-                    self.currency_symbols[1],
-                    dp2(cost),
-                    self.currency_symbols[1],
-                    dp2(cost - picked_cost),
-                    self.currency_symbols[1],
-                    dp2(kwh),
-                    predictions,
-                    dp2(time.time() - time_start),
-                )
-            )
+            if accepted:
+                self.car_battery_early_active[car_n] = base[best[1]].get("start_orig", base[best[1]]["start"])
+                if self.car_charging_slots[car_n] != accepted:
+                    self.car_charging_slots[car_n] = accepted
+                    changed = True
+            else:
+                if was_active:
+                    self.log("Car {} battery early: stopped ({})".format(car_n, reason))
+                    del self.car_battery_early_active[car_n]
+                if any(slot.get("battery_early", False) for slot in self.car_charging_slots[car_n]):
+                    self.car_charging_slots[car_n] = base
+                    changed = True
+
+        if changed:
+            self.publish_car_plan()
 
     def car_ready_minutes(self, car_n):
         """

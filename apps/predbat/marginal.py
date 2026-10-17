@@ -35,7 +35,7 @@ class Marginal:
     to a Home Assistant sensor.
     """
 
-    def score_extra_load(self, extra_load, kernel_static_cache=None, include_battery_value=False):
+    def score_extra_load(self, extra_load, kernel_static_cache=None, include_battery_value=False, car_charging_slots=None):
         """Return the metric of the current best plan with extra_load added to the load forecast.
 
         extra_load is {relative_minute: kWh_in_that_PREDICT_STEP}, matching load_minutes_step; minutes
@@ -51,7 +51,13 @@ class Marginal:
 
         kernel_static_cache is passed straight through to the Prediction. Every context built with the
         same cache must differ ONLY in its load, which is all this varies - see create_kernel_context.
+
+        car_charging_slots replaces the modelled car slots (car_charging_slots_model()) for this run, so a
+        caller can price moving car charge between slots. The kernel's static cache holds the car slots,
+        so it is not used for such a run - a context built from it would silently keep the old slots.
         """
+        if car_charging_slots is not None:
+            kernel_static_cache = None
         # Shallow copy is a full copy: load_minutes_step is a flat minute -> kWh dict
         modified_load = dict(self.load_minutes_step)
         for minute, amount in extra_load.items():
@@ -59,7 +65,15 @@ class Marginal:
                 modified_load[minute] += amount
 
         # No need to include 10% extra load as we only run normal simulations.
-        pred = Prediction(self, self.pv_forecast_minute_step, self.pv_forecast_minute_step, modified_load, modified_load, kernel_static_cache=kernel_static_cache, car_charging_slots=self.car_charging_slots_model())
+        pred = Prediction(
+            self,
+            self.pv_forecast_minute_step,
+            self.pv_forecast_minute_step,
+            modified_load,
+            modified_load,
+            kernel_static_cache=kernel_static_cache,
+            car_charging_slots=car_charging_slots if car_charging_slots is not None else self.car_charging_slots_model(),
+        )
         (new_metric, _import_battery, _import_house, _export, _soc_min, final_soc, _soc_min_minute, _cycle, _metric_keep, final_iboost, *_) = pred.run_prediction(
             self.charge_limit_best,
             self.charge_window_best,

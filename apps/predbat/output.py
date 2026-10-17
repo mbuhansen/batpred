@@ -206,7 +206,7 @@ class Output:
         )
         return allowed, reason
 
-    def publish_car_charging_mode(self, car_n, postfix, slot, solar_allowed, solar_reason):
+    def publish_car_charging_mode(self, car_n, postfix, slot, solar_allowed, solar_reason, slot_reason="grid_slot"):
         """
         Publish the single charging decision for this car: charge now, follow the sun, or do not charge.
 
@@ -219,9 +219,12 @@ class Output:
         the surplus is worth more exported, the home battery is below the priority the forecast assumes,
         or this car does not do solar charging at all. A charger holding its own departure plan keeps it
         either way: off stops it acting on the plan, it does not delete it.
+
+        slot_reason says why a slot is charging now: grid_slot for a planned slot, battery_early for charge
+        plan_car_battery_early brought forward from the home battery.
         """
         if slot:
-            mode, reason = CAR_MODE_NOW, "grid_slot"
+            mode, reason = CAR_MODE_NOW, slot_reason
         elif solar_allowed:
             mode, reason = CAR_MODE_SOLAR, "solar"
         elif solar_reason in ("export_better", "solar_disabled", "home_battery_low"):
@@ -253,6 +256,7 @@ class Output:
                 postfix = "_" + str(car_n)
             solar_allowed, solar_reason = self.publish_car_solar_slot(car_n, postfix)
             slot = False
+            slot_reason = "grid_slot"
             if not self.car_charging_slots[car_n]:
                 self.dashboard_item(
                     "binary_sensor." + self.prefix + "_car_charging_slot" + postfix,
@@ -276,6 +280,8 @@ class Output:
                 window = self.car_charging_slots[car_n][0]
                 if self.minutes_now >= window["start"] and self.minutes_now < window["end"] and window["kwh"] > 0:
                     slot = True
+                    if window.get("battery_early", False):
+                        slot_reason = "battery_early"
 
                 # Show when the window really began, not the planner's clamped start, so the
                 # displayed start time stops walking forward once charging is underway (#269).
@@ -334,7 +340,7 @@ class Output:
                     },
                 )
 
-            self.publish_car_charging_mode(car_n, postfix, slot, solar_allowed, solar_reason)
+            self.publish_car_charging_mode(car_n, postfix, slot, solar_allowed, solar_reason, slot_reason=slot_reason)
 
     def publish_rates_export(self):
         """

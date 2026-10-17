@@ -146,9 +146,13 @@ CAR_UNPLUGGED_RESPONSE = ["off", "false", "no", "0", "disconnected", "unavailabl
 CAR_MODE_NOW = "now"
 CAR_MODE_SOLAR = "solar"
 CAR_MODE_OFF = "off"
-# Ceiling on how many candidate windows log_car_window_scoring prices per car per cycle. Each is a full
-# forecast run, so an unbounded ready time on a big car would otherwise spend seconds in a diagnostic.
+# Ceiling on how many planned slots plan_car_battery_early tries to move charge out of, per car per cycle.
+# Each is a full forecast run, so an unbounded ready time on a big car would otherwise spend seconds here.
 CAR_SCORE_MAX_WINDOWS = 24
+# Length of the "charge now from the battery" chunk plan_car_battery_early moves forward each cycle, and how
+# much dearer (per kWh moved) the plan may get before the move is no longer counted as free
+CAR_BATTERY_EARLY_MINUTES = 30
+CAR_BATTERY_EARLY_TOLERANCE = 1.0
 # Sentinel values for an export window's target SoC/limit (export_limits_best and friends).
 # A real target is any value below EXPORT_LIMIT_FREEZE, expressed as a percentage 0-100
 # (see calc_percent_limit) with the fractional part sometimes encoding a low-power export rate.

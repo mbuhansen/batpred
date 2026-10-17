@@ -1056,6 +1056,15 @@ CONFIG_ITEMS = [
         "enable_condition": "num_cars > 0",
     },
     {
+        "name": "car_charging_battery_early",
+        "friendly_name": "Charge the car early from the battery when it costs nothing",
+        "type": "switch",
+        "icon": "mdi:car-electric",
+        "default": False,
+        "enable": "num_cars",
+        "enable_condition": "num_cars > 0",
+    },
+    {
         "name": "car_charging_solar",
         "friendly_name": "Car solar charging (Car 0)",
         "type": "switch",

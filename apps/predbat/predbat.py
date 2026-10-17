@@ -442,6 +442,11 @@ class PredBat(hass.Hass, Octopus, Energidataservice, Stromligning, Fetch, Plan, 
         self.octopus_saving_slots = []
         self.car_charging_slots = []
         self.car_charging_now_slots = []
+        # Per car: start_orig of the slot an early battery chunk was moved out of, and the price-sorted plan
+        # it was moved from (see plan_car_battery_early). Memory only, so a restart begins with it off.
+        self.car_charging_battery_early = False
+        self.car_battery_early_active = {}
+        self.car_battery_early_base = {}
         self.reserve = 0
         self.reserve_percent = 0.0
         self.reserve_current = 0

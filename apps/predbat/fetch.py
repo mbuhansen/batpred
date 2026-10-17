@@ -1876,6 +1876,8 @@ class Fetch:
             iog_entity_ids = []
 
         for car_n in range(self.num_cars):
+            # Only a car planned below has a base plan for plan_car_battery_early this cycle
+            self.car_battery_early_base.pop(car_n, None)
             if self.octopus_intelligent_charging and car_n < len(iog_entity_ids) and iog_entity_ids[car_n]:
                 if self.car_charging_planned[car_n]:
                     self.log("Car {} on Octopus Intelligent, active plan for charge".format(car_n))
@@ -1895,6 +1897,8 @@ class Fetch:
                 )
                 # The tariff's own windows: a car cannot export, so the plan's pre-event windows are no use to it
                 self.car_charging_slots[car_n] = self.plan_car_charging(car_n, self.low_rates_tariff)
+                # Keep an early battery charge running across the rebuild, see plan_car_battery_early
+                self.car_charging_slots[car_n] = self.car_battery_early_reapply(car_n, self.car_charging_slots[car_n])
             else:
                 self.log("Car {} charging is not planned as it is not plugged in".format(car_n))
 
@@ -3366,6 +3370,7 @@ class Fetch:
         self.car_charging_planned_response = [str(response).lower() for response in self.get_arg("car_charging_planned_response", ["yes", "on", "enable", "true"])]
         self.car_charging_now_response = [str(response).lower() for response in self.get_arg("car_charging_now_response", ["yes", "on", "enable", "true", "charging"])]
         self.car_charging_from_battery = self.get_arg("car_charging_from_battery")
+        self.car_charging_battery_early = self.get_arg("car_charging_battery_early", False)
         if isinstance(getattr(self, "args_from_apps_yaml", {}).get("car_charging_solar"), list):
             self.log("Warn: car_charging_solar is now a Home Assistant switch per car (switch.predbat_car_charging_solar), the apps.yaml list is ignored - see the car charging docs")
             self.record_status("Warn: car_charging_solar has moved from apps.yaml to a Home Assistant switch", had_errors=True)

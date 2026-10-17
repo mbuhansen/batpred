@@ -1046,6 +1046,14 @@ On inverters without a timed pause, the car hold does not set the discharge rate
 The home battery can still charge from the grid/solar in either case. Only use this if Predbat knows your car charging plan,
 e.g. you are using Intelligent Octopus or you use the car slots in Predbat to control your car charging.
 
+- **switch.predbat_car_charging_battery_early** (default Off) - only used when **switch.predbat_car_charging_from_battery** is On. Predbat still picks the cheapest hours for the car,
+but where the plan has the home battery supplying the car in one of those slots, that energy costs the same whenever it is taken - so Predbat starts charging the car now from the
+battery instead, and the car has the range sooner. Every cycle Predbat tries moving a 30 minute chunk of the car's charge from a planned slot to now and re-runs the forecast. The
+chunk is only kept if the plan gets no dearer (within 1p/kWh) - for example it stays off when the slot is charged from cheap grid import, or the battery is needed for the house
+before then. It never runs while the battery is exporting, or charging or held by a charge window, and the battery is never held for the car. While it runs, the chunk appears as
+the first window in `binary_sensor.predbat_car_charging_slot` and `sensor.predbat_car_charging_mode` is `now` with reason `battery_early`, so any charger that follows the Predbat
+car plan (evcc, GivEnergy, Ohme, Zappi, Wallbox) starts charging. Each decision is logged as `Car 0 battery early: ...`.
+
   *Note:* If **switch.predbat_car_energy_reported_load** is set to Off (car outside the CT clamp), this setting has no effect as the battery cannot supply the car directly. Predbat will automatically treat the car as being supplied from the grid/export.
 
 - **input_number.predbat_car_charging_loss** gives the percentage amount of energy lost when charging the car (load in the home vs energy added to the battery).
