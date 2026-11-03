@@ -4691,6 +4691,7 @@ class Fetch:
         self.set_charge_low_power = self.get_arg("set_charge_low_power")
         self.set_export_low_power = self.get_arg("set_export_low_power")
         self.charge_low_power_margin = self.get_arg("charge_low_power_margin")
+        self.charge_hold_overshoot = self.get_arg("charge_hold_overshoot")
         self.low_power_pv_threshold_w = self.get_arg("low_power_pv_threshold_w")
         self.set_charge_low_power_solar_full_rate = self.get_arg("set_charge_low_power_solar_full_rate")
         self.calculate_export_first = True

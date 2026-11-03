@@ -1308,6 +1308,18 @@ CONFIG_ITEMS = [
         "default": 10,
     },
     {
+        "name": "charge_hold_overshoot",
+        "friendly_name": "Charge hold overshoot",
+        "type": "input_number",
+        "min": 0,
+        "max": 5,
+        "step": 1,
+        "unit": "%",
+        "icon": "mdi:battery-arrow-up",
+        "enable": "expert_mode",
+        "default": 0,
+    },
+    {
         "name": "low_power_pv_threshold_w",
         "friendly_name": "Low power mode PV threshold",
         "type": "input_number",

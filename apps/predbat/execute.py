@@ -580,6 +580,11 @@ class Execute:
                     if self.minutes_now >= minutes_start and self.minutes_now < minutes_end:
                         is_freeze_charge = self.is_freeze_charge(self.charge_limit_best[0])
                         target_soc = calc_percent_limit(self.charge_limit_best[0], self.soc_max) if not is_freeze_charge else calc_percent_limit(inverter.soc_kw, inverter.soc_max)
+                        # Charge past the plan's target by charge_hold_overshoot, so a BMS that settles lower once charging stops lands on the target
+                        overshoot = 0.0
+                        if not is_freeze_charge:
+                            overshoot = self.charge_target_overshoot(target_soc) - target_soc
+                            target_soc += overshoot
                         inv_target_soc_percent = self.adjust_battery_target_multi(inverter, target_soc, True, False, check=True, isFreezeCharge=is_freeze_charge)
 
                         current_charge_rate = inverter.get_current_charge_rate()
@@ -673,11 +678,11 @@ class Execute:
                             # and the current charge level is above the target for all inverters
                             #
                             # Once a hold is in place (reserve already raised to the target or above) keep it while the SoC
-                            # stays within 1% below the target. Inverters that report whole-percent SoC otherwise drop to
-                            # Charging on every 1% wobble and back to Hold on the next, rewriting reserve each cycle.
+                            # stays within 1% below the plan's target (before any overshoot). Inverters that report whole-percent
+                            # SoC otherwise drop to Charging on every 1% wobble and back to Hold on the next, rewriting reserve each cycle.
                             hold_threshold = inv_target_soc_percent
                             if (inv_target_soc_percent < 100.0) and (inverter.reserve_percent_current >= inv_target_soc_percent > inverter.reserve_percent):
-                                hold_threshold = inv_target_soc_percent - 1.0
+                                hold_threshold = inv_target_soc_percent - overshoot - 1.0
                             if self.set_soc_enable and inverter.soc_percent >= hold_threshold:
                                 status = RUN_STATE_HOLD_CHARGING
                                 status_per_inverter[inverter.id] = status
@@ -687,7 +692,7 @@ class Execute:
                                     )
                                 )
 
-                                if (inv_target_soc_percent < 100.0) and (inverter.soc_percent >= inv_target_soc_percent - 1.0):
+                                if (inv_target_soc_percent < 100.0) and (inverter.soc_percent >= min(hold_threshold, inv_target_soc_percent - 1.0)):
                                     # If we are at or above the target, or within 1% below it, hold charge by disabling the charge window.
                                     # Only keep charging enabled if SOC is more than 1% below target.
                                     if self.set_soc_enable and ((self.set_reserve_enable and self.set_reserve_hold and inverter.reserve_max >= inv_target_soc_percent) or inverter.inv_has_timed_pause):
@@ -1112,7 +1117,7 @@ class Execute:
                                 self.log("Inverter {} resetting charging SoC as we are not charging and inverter_soc_reset is enabled".format(inverter.id))
                                 self.adjust_battery_target_multi(inverter, 100.0, isCharging, isExporting)
                             elif isCharging:
-                                target_soc = calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max)
+                                target_soc = self.charge_target_overshoot(calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max))
                                 self.log("Inverter {} setting charging SoC to {}% as per target".format(inverter.id, target_soc))
                                 inv_target_soc = self.adjust_battery_target_multi(inverter, target_soc, isCharging, isExporting)
                                 inverter.adjust_charge_immediate(inv_target_soc)
@@ -1120,7 +1125,7 @@ class Execute:
                                 self.log("Inverter {} setting charging SoC to 0% as we are not charging and inverter doesn't support target SoC".format(inverter.id))
                                 self.adjust_battery_target_multi(inverter, 0, isCharging, isExporting)
                             else:
-                                target_soc = calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max)
+                                target_soc = self.charge_target_overshoot(calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max))
                                 self.log("Inverter {} setting charging SoC to {}% as per target for when charge window starts".format(inverter.id, target_soc))
                                 self.adjust_battery_target_multi(inverter, target_soc, isCharging, isExporting)
                     else:
@@ -1163,7 +1168,8 @@ class Execute:
                             inv_target_soc_percent = self.adjust_battery_target_multi(inverter, calc_percent_limit(self.soc_kw, self.soc_max), isCharging, isExporting, check=True, isFreezeCharge=True)
                             inverter.adjust_charge_immediate(inv_target_soc_percent, freeze=True)
                         else:
-                            inv_target_soc_percent = self.adjust_battery_target_multi(inverter, calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max), isCharging, isExporting, check=True)
+                            target_soc = self.charge_target_overshoot(calc_percent_limit(max(self.charge_limit_best[0], self.reserve), self.soc_max))
+                            inv_target_soc_percent = self.adjust_battery_target_multi(inverter, target_soc, isCharging, isExporting, check=True)
                             inverter.adjust_charge_immediate(inv_target_soc_percent, freeze=True)
 
             # Charging/Discharging off via service
@@ -1262,6 +1268,19 @@ class Execute:
         if not check:
             inverter.adjust_battery_target(new_soc_percent, is_charging, is_exporting)
         return new_soc_percent
+
+    def charge_target_overshoot(self, target_soc_percent):
+        """
+        Raise a charge target SoC % by charge_hold_overshoot, capped at 100%.
+
+        A BMS that reads high while charging settles 1-2% lower once charging stops; charging a little
+        past the plan's target makes the battery land on the target instead of under it. Targets of 0%
+        and 100% are left alone.
+        """
+        overshoot = self.charge_hold_overshoot
+        if overshoot <= 0 or target_soc_percent <= 0 or target_soc_percent >= 100.0:
+            return target_soc_percent
+        return min(target_soc_percent + overshoot, 100.0)
 
     def export_target_soc_percent(self):
         """

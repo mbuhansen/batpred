@@ -253,6 +253,7 @@ def run_execute_test(
     inverter_discharge_time_minutes_start=None,
     inverter_discharge_time_minutes_end=None,
     reserve_current_percent=None,
+    charge_hold_overshoot=0,
 ):
     if assert_immediate_charge_soc_freeze_array is None:
         assert_immediate_charge_soc_freeze_array = []
@@ -278,6 +279,7 @@ def run_execute_test(
     my_predbat.set_charge_low_power = set_charge_low_power
     my_predbat.set_export_low_power = set_export_low_power
     my_predbat.charge_low_power_margin = charge_low_power_margin
+    my_predbat.charge_hold_overshoot = charge_hold_overshoot
     my_predbat.minutes_now = minutes_now
     my_predbat.battery_temperature_charge_curve = {20: 1.0, 10: 0.5, 9: 0.5, 8: 0.5, 7: 0.5, 6: 0.3, 5: 0.3, 4: 0.3, 3: 0.262, 2: 0.1, 1: 0.1, 0: 0}
     # Flat PV forecast of pv_forecast kW, reset every scenario so a solar run does not leak into the next one
@@ -2731,6 +2733,90 @@ def run_execute_tests(my_predbat):
         assert_immediate_soc_target=50,
         has_timed_pause=False,
         reserve_current_percent=51,
+    )
+    if failed:
+        return failed
+    # charge_hold_overshoot 1%: below target + 1% keep charging, with the inverter target raised to 51%
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_overshoot_charge",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Charging",
+        assert_charge_time_enable=True,
+        soc_kw=5,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_soc_target=51,
+        assert_immediate_soc_target=51,
+        has_timed_pause=False,
+        charge_hold_overshoot=1,
+    )
+    if failed:
+        return failed
+    # Reaching target + 1% holds, with the reserve one above that
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_overshoot_hold",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Hold charging",
+        soc_kw=5.1,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_discharge_rate=0,
+        assert_pause_discharge=False,
+        assert_reserve=52,
+        assert_immediate_soc_target=51,
+        has_timed_pause=False,
+        charge_hold_overshoot=1,
+    )
+    if failed:
+        return failed
+    # The BMS settles 2% after the overshoot - still within 1% of the plan's 50% target, so the hold stays
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_overshoot_settle",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Hold charging",
+        soc_kw=4.9,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_discharge_rate=0,
+        assert_pause_discharge=False,
+        assert_reserve=52,
+        assert_immediate_soc_target=51,
+        has_timed_pause=False,
+        reserve_current_percent=52,
+        charge_hold_overshoot=1,
+    )
+    if failed:
+        return failed
+    # More than 1% below the plan's target - charge again to target + 1%
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_overshoot_drop",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Charging",
+        assert_charge_time_enable=True,
+        soc_kw=4.8,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_soc_target=51,
+        assert_immediate_soc_target=51,
+        has_timed_pause=False,
+        reserve_current_percent=52,
+        charge_hold_overshoot=1,
     )
     if failed:
         return failed

@@ -530,6 +530,11 @@ solar, so leave it On unless you specifically want the slow charge.
 **switch.predbat_set_reserve_enable** (_expert_mode_) When turned On (the default) the battery reserve setting is used to hold the battery charge level
 once it has been reached or to protect against discharging beyond the set limit.
 
+**input_number.predbat_charge_hold_overshoot** (_expert_mode_) How many percent past the planned target SoC to charge before holding, from 0 to 5. Default is 0 (stop at the target).
+Some batteries read high while charging, then settle 1-2% lower once charging stops. Setting this to 1 or 2 makes them land on the target instead of below it.
+The hold reserve is raised by the same amount. Once holding, Predbat keeps the hold until the SoC is more than 1% below the planned target, so a settling SoC does not restart charging.
+The plan does not include this extra energy, so keep it small.
+
 **switch.predbat_set_charge_freeze** (_expert mode_) When turned On will allow Predbat to hold the current battery level while drawing from the grid/solar as an alternative to charging. On by default.
 
 **switch.predbat_set_charge_freeze_only** (_expert mode_) When turned On charging the battery from the grid is prevented, but charge freeze can be used (if enabled) to hold the current battery
