@@ -252,6 +252,7 @@ def run_execute_test(
     set_charge_freeze_only=False,
     inverter_discharge_time_minutes_start=None,
     inverter_discharge_time_minutes_end=None,
+    reserve_current_percent=None,
 ):
     if assert_immediate_charge_soc_freeze_array is None:
         assert_immediate_charge_soc_freeze_array = []
@@ -350,7 +351,7 @@ def run_execute_test(
         reserve_percent = calc_percent_limit(reserve_kwh, inverter.soc_max)
         inverter.reserve_percent = reserve_percent
         inverter.reserve_current = reserve_percent
-        inverter.reserve_percent_current = reserve_percent
+        inverter.reserve_percent_current = reserve_percent if reserve_current_percent is None else reserve_current_percent
         inverter.reserve = reserve_kwh
         inverter.reserve_max = reserve_max_array[inverter.id] if reserve_max_array else reserve_max
         inverter.battery_temperature = battery_temperature
@@ -2672,6 +2673,67 @@ def run_execute_tests(my_predbat):
         assert_immediate_soc_target=50,
         has_timed_pause=False,
     )
+    # Hold hysteresis: 1% below the 50% target while the reserve is already holding at 51% keeps the hold
+    # instead of flipping back to Charging (inverters reporting whole-percent SoC wobble by 1%)
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_hysteresis_hold",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Hold charging",
+        soc_kw=4.9,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_discharge_rate=0,
+        assert_pause_discharge=False,
+        assert_reserve=51,
+        assert_immediate_soc_target=50,
+        has_timed_pause=False,
+        reserve_current_percent=51,
+    )
+    if failed:
+        return failed
+    # Same SoC but no hold in place yet (reserve at its minimum) - keep charging to the target
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_hysteresis_charge",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Charging",
+        assert_charge_time_enable=True,
+        soc_kw=4.9,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_soc_target=50,
+        assert_immediate_soc_target=50,
+        has_timed_pause=False,
+    )
+    if failed:
+        return failed
+    # Holding, but more than 1% below the target - charge again
+    failed |= run_execute_test(
+        my_predbat,
+        "charge2c_hysteresis_drop",
+        charge_window_best=charge_window_best,
+        charge_limit_best=charge_limit_best2,
+        set_charge_window=True,
+        set_export_window=True,
+        assert_status="Charging",
+        assert_charge_time_enable=True,
+        soc_kw=4.8,
+        assert_charge_start_time_minutes=-1,
+        assert_charge_end_time_minutes=my_predbat.minutes_now + 60,
+        assert_soc_target=50,
+        assert_immediate_soc_target=50,
+        has_timed_pause=False,
+        reserve_current_percent=51,
+    )
+    if failed:
+        return failed
     # Here the target is 5kWh and we are at 9kWh, so we will hold charge and let it discharge.
     failed |= run_execute_test(
         my_predbat,

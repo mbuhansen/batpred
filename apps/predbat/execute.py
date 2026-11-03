@@ -671,12 +671,19 @@ class Execute:
                         else:
                             # We can only hold charge if a) we have a way to hold the charge level on the reserve or with a pause feature
                             # and the current charge level is above the target for all inverters
-                            if self.set_soc_enable and inverter.soc_percent >= inv_target_soc_percent:
+                            #
+                            # Once a hold is in place (reserve already raised to the target or above) keep it while the SoC
+                            # stays within 1% below the target. Inverters that report whole-percent SoC otherwise drop to
+                            # Charging on every 1% wobble and back to Hold on the next, rewriting reserve each cycle.
+                            hold_threshold = inv_target_soc_percent
+                            if (inv_target_soc_percent < 100.0) and (inverter.reserve_percent_current >= inv_target_soc_percent > inverter.reserve_percent):
+                                hold_threshold = inv_target_soc_percent - 1.0
+                            if self.set_soc_enable and inverter.soc_percent >= hold_threshold:
                                 status = RUN_STATE_HOLD_CHARGING
                                 status_per_inverter[inverter.id] = status
                                 self.log(
-                                    "Inverter {} Hold charging as SoC {}% is above target SoC {}% (global soc target {}%) set_discharge_during_charge {}".format(
-                                        inverter.id, inverter.soc_percent, dp0(inv_target_soc_percent), dp0(target_soc), self.set_discharge_during_charge
+                                    "Inverter {} Hold charging as SoC {}% is above hold threshold {}% (target SoC {}%, global soc target {}%) set_discharge_during_charge {}".format(
+                                        inverter.id, inverter.soc_percent, dp0(hold_threshold), dp0(inv_target_soc_percent), dp0(target_soc), self.set_discharge_during_charge
                                     )
                                 )
 
