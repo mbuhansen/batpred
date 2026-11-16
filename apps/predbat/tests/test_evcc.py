@@ -13,6 +13,7 @@ SAMPLE_STATE is trimmed from a real evcc 0.313.2 /api/state response (1-phase 6-
 a PHEV with three repeating plans and no vehicle-level SoC), which is the shape the component
 has to keep working against as evcc's schema drifts.
 """
+
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 import copy
