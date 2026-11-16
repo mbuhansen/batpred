@@ -395,7 +395,13 @@ from tests.test_ml_memory import run_ml_memory_tests
 from tests.test_ml_training_perf import run_ml_training_perf_tests
 from tests.test_temperature import test_temperature
 from tests.test_http_sync import run_http_sync_tests
-from tests.test_battery_temperature_fetch import test_battery_temperature_fetch, test_battery_temperature_history_stuck_warning, test_battery_temperature_history_stuck_warning_fetch, test_battery_temperature_history_stuck_warning_once
+from tests.test_battery_temperature_fetch import (
+    test_battery_temperature_fetch,
+    test_battery_temperature_fetch_average,
+    test_battery_temperature_history_stuck_warning,
+    test_battery_temperature_history_stuck_warning_fetch,
+    test_battery_temperature_history_stuck_warning_once,
+)
 from tests.test_oauth_mixin import run_oauth_mixin_tests
 from tests.test_fox_oauth import run_fox_oauth_tests
 from tests.test_band_rate_text import test_band_rate_text
@@ -410,6 +416,7 @@ from tests.test_prune_dead_slots import run_prune_dead_slots_tests
 from tests.test_export_floor import run_export_floor_tests
 from tests.test_plan_pv10_hedge import run_plan_pv10_hedge_tests
 from tests.test_plan_freeze_export_fallback import run_plan_freeze_export_fallback_tests
+from tests.test_plan_dark_freeze import run_plan_dark_freeze_tests
 from tests.test_clip_charge_slots import run_clip_charge_slots_tests
 from tests.test_discard_unused_charge_slots import run_discard_unused_charge_slots_tests
 from tests.test_discard_unused_export_slots import run_discard_unused_export_slots_tests
@@ -968,6 +975,7 @@ def main():
         # External Temperature API tests
         ("http_sync", run_http_sync_tests, "Synchronous aiohttp HTTP helper (replaces requests) and no-requests guard", False),
         ("battery_temperature_fetch", test_battery_temperature_fetch, "Battery temperature history fetched for the prediction window only", False),
+        ("battery_temperature_fetch_average", test_battery_temperature_fetch_average, "Battery temperature history from several sensors is their average, not their sum", False),
         ("battery_temperature_stuck_warning", test_battery_temperature_history_stuck_warning, "Battery temperature history stuck at 0 warns, naming the GivTCP rename (#6193)", False),
         ("battery_temperature_stuck_warning_fetch", test_battery_temperature_history_stuck_warning_fetch, "Battery temperature stuck warning through the real fetch path (#6193)", False),
         ("battery_temperature_stuck_warning_once", test_battery_temperature_history_stuck_warning_once, "Battery temperature stuck warning reported once, curve-aware wording (#6193)", False),
@@ -988,6 +996,7 @@ def main():
         ("export_floor", run_export_floor_tests, "Realistic pv10 export floor, pinning and staircase merge tests", False),
         ("plan_pv10_hedge", run_plan_pv10_hedge_tests, "End to end: a bad PV10 forecast makes the overnight charge bigger", False),
         ("plan_freeze_export_fallback", run_plan_freeze_export_fallback_tests, "End to end: without Freeze Export a target export stands in for it", False),
+        ("plan_dark_freeze", run_plan_dark_freeze_tests, "End to end: a Freeze Export with no solar is pruned to Demand", False),
         ("clip_charge_slots", run_clip_charge_slots_tests, "Clip charge slots tests", False),
         ("discard_unused_charge_slots", run_discard_unused_charge_slots_tests, "Discard unused charge slots tests", False),
         ("discard_unused_export_slots", run_discard_unused_export_slots_tests, "Discard unused export slots tests", False),
