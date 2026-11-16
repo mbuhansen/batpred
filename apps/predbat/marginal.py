@@ -46,8 +46,8 @@ class Marginal:
         include_battery_value credits the charge still in the battery at the end of the plan, the way
         metric_blend does for the planner's own metric. run_prediction does not, so without it a load
         the battery absorbs looks free whenever the horizon ends with charge to spare - exactly the
-        question a caller comparing battery against grid is asking. Off by default so
-        calculate_marginal_costs keeps publishing the numbers it always has.
+        question a caller comparing battery against grid is asking. calculate_marginal_costs turns it on
+        (#5107), matching marginal_plan_cost; off by default for other callers.
 
         kernel_static_cache is passed straight through to the Prediction. Every context built with the
         same cache must differ ONLY in its load, which is all this varies - see create_kernel_context.
@@ -74,7 +74,7 @@ class Marginal:
             kernel_static_cache=kernel_static_cache,
             car_charging_slots=car_charging_slots if car_charging_slots is not None else self.car_charging_slots_model(),
         )
-        (new_metric, _import_battery, _import_house, _export, _soc_min, final_soc, _soc_min_minute, _cycle, _metric_keep, final_iboost, *_) = pred.run_prediction(
+        new_metric, _import_battery, _import_house, _export, _soc_min, final_soc, _soc_min_minute, _cycle, _metric_keep, final_iboost, *_ = pred.run_prediction(
             self.charge_limit_best,
             self.charge_window_best,
             self.export_window_best,
@@ -95,7 +95,8 @@ class Marginal:
 
         Runs an internal baseline prediction (save=None, so standing charges are
         excluded) against the current best plan, then runs N what-if simulations
-        with the same save=None conditions.
+        with the same save=None conditions. Each side's cost is net of the value of
+        the energy left in the battery at the end of the plan, as in compute_metric.
         Taking the delta against the internal baseline ensures both sides are
         computed consistently without the standing-charge offset that is only
         added when save='best'/'base'.
@@ -108,13 +109,20 @@ class Marginal:
         """
         # Run a baseline prediction with the original (unmodified) load and save=None
         # so standing charges are NOT included — matching the what-if simulations exactly.
-        (baseline_metric, *_) = self.prediction.run_prediction(
-            self.charge_limit_best,
-            self.charge_window_best,
-            self.export_window_best,
-            self.export_limits_best,
-            False,
-            self.end_record,
+        # Energy left in the battery at the end of the plan is valued as the planner values it
+        # (compute_metric's battery_value term). Without it, extra load the battery covers from
+        # energy it would otherwise still hold at end_record costs nothing, and reads as cheap (#5107).
+        value_rate = self.battery_value_rate(self.minutes_now + self.end_record)
+        baseline_metric = self.marginal_plan_cost(
+            self.prediction.run_prediction(
+                self.charge_limit_best,
+                self.charge_window_best,
+                self.export_window_best,
+                self.export_limits_best,
+                False,
+                self.end_record,
+            ),
+            value_rate,
         )
         self.marginal_baseline_metric = baseline_metric
         self.log("Marginal costs baseline metric (no standing charge): {}".format(baseline_metric))
@@ -139,7 +147,7 @@ class Marginal:
 
                 # Inject extra load into the 1-hour window starting at `offset` minutes from now
                 extra_load = {minute: extra_per_step for minute in range(offset, offset + 60, PREDICT_STEP)}
-                new_metric = self.score_extra_load(extra_load, kernel_static_cache=kernel_static_cache)
+                new_metric = self.score_extra_load(extra_load, kernel_static_cache=kernel_static_cache, include_battery_value=True)
 
                 # Marginal cost in currency units per kWh = delta metric / extra kWh
                 marginal_cost = dp2((new_metric - baseline_metric) / extra_kwh)
@@ -161,6 +169,17 @@ class Marginal:
         self.marginal_grid_import = grid_import
         self.marginal_grid_export = grid_export
         self.publish_marginal_costs()
+
+    def marginal_plan_cost(self, result, value_rate):
+        """Return a run_prediction result's cost less the value of what the plan leaves stored.
+
+        Mirrors the battery_value term of compute_metric (plan.py) - keep the two in step: the
+        battery's end SoC and any iBoost energy, each scaled as the planner scales them, valued at
+        value_rate. Only that term is applied; metric_keep, battery cycle and carbon are planner
+        steering penalties rather than money, so a marginal cost leaves them out.
+        """
+        cost, soc, final_iboost = result[0], result[5], result[9]
+        return cost - (soc * self.metric_battery_value_scaling + final_iboost * self.iboost_value_scaling) * value_rate
 
     def publish_marginal_costs(self):
         """Publish the marginal energy cost matrix as a Home Assistant sensor.
@@ -193,8 +212,9 @@ class Marginal:
             "timestamp": self.now_utc.isoformat(),
         }
 
-        min_import_cost = self.rate_min
-        max_import_cost = self.rate_max
+        # Base tariff, not rate_min/rate_max: a free session zeroes rate_min, so nothing could ever read as cheap (#5382)
+        min_import_cost = self.rate_min_base
+        max_import_cost = self.rate_max_base
 
         cheap_threshold = min_import_cost * 1.2  # Example threshold for "cheap" energy
         moderate_threshold = max(max_import_cost * 0.5, min_import_cost * 1.5)  # "Moderate" if above cheap but below half of max

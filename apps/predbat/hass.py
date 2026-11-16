@@ -51,7 +51,7 @@ def write_git_version_marker():
 write_git_version_marker()
 
 import predbat
-from utils import load_apps_yaml, predbat_log_count, predbat_log_name, rotate_predbat_logs
+from utils import describe_apps_yaml_error, load_apps_yaml, load_secrets, predbat_log_count, predbat_log_name, rotate_predbat_logs
 import time
 from datetime import datetime, timedelta, timezone
 from multiprocessing import set_start_method
@@ -80,12 +80,15 @@ def check_modified(py_files, start_time):
     return False
 
 
-def resolve_apps_yaml_path():
+def resolve_apps_yaml_path(apps_file=None):
     """
     Resolve the one real apps.yaml path this instance is actually configured to use, using the
     same PREDBAT_APPS_FILE resolution applied when the config itself is loaded.
+
+    Pass the instance's own apps_file (Hass.apps_file) so the answer is per instance; with no
+    argument it falls back to the process environment.
     """
-    return os.path.abspath(os.getenv("PREDBAT_APPS_FILE", "apps.yaml"))
+    return os.path.abspath(apps_file or os.getenv("PREDBAT_APPS_FILE", "apps.yaml"))
 
 
 def collect_watch_files(roots, apps_file_path):
@@ -159,7 +162,7 @@ async def main():
     # Find all .py files in the directory hierarchy, plus the one real apps.yaml this
     # instance is actually configured to use (not any file that merely happens to share
     # that name elsewhere in the tree - see #4397/#4396)
-    py_files = collect_watch_files(roots, resolve_apps_yaml_path())
+    py_files = collect_watch_files(roots, resolve_apps_yaml_path(p_han.apps_file))
 
     print("Watching {} for changes".format(py_files))
 
@@ -266,10 +269,16 @@ class Hass(LogRedaction):
             t.join(5 * 60)
         self.logfile.close()
 
-    def __init__(self):
+    def __init__(self, apps_file=None, secrets_file=None):
         """
         Start Predbat
+
+        apps_file / secrets_file override $PREDBAT_APPS_FILE / $PREDBAT_SECRETS_FILE for this
+        instance only. The environment is read once, here, and the values kept on the instance,
+        so several engines in one process can each load their own configuration.
         """
+        self.apps_file = apps_file if apps_file is not None else os.getenv("PREDBAT_APPS_FILE", "apps.yaml")
+        self.secrets_file = secrets_file if secrets_file is not None else os.getenv("PREDBAT_SECRETS_FILE")
         self.args = {}
         self.run_list = []
         self.threads = []
@@ -280,9 +289,15 @@ class Hass(LogRedaction):
 
         # Load apps.yaml (resolving !secret) through the shared loader
         try:
-            self.args, self.secrets = load_apps_yaml(log=self.log)
-        except yaml.YAMLError as exc:
-            print(exc)
+            self.args, self.secrets = load_apps_yaml(apps_file=self.apps_file, log=self.log, secrets_file=self.secrets_file)
+        except (yaml.YAMLError, KeyError, OSError) as exc:
+            # Logged rather than printed so the reason reaches predbat.log, not only the add-on
+            # console - the process exits before the web interface starts, so a bare print left
+            # predbat.log showing nothing but the restart loop (GH#5530). The secret names let
+            # the message repeat a mistyped reference without echoing an unknown tag that might
+            # be a pasted credential.
+            secret_names = load_secrets(log=lambda message, **kwargs: None, secrets_file=self.secrets_file).keys()
+            self.log(describe_apps_yaml_error(exc, apps_file=self.apps_file, secret_names=secret_names), quiet=False)
             sys.exit(1)
 
         # Both args and secrets have just been populated, so the redaction pattern built from them

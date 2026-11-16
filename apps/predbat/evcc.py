@@ -30,7 +30,7 @@ import asyncio
 import json
 import aiohttp
 
-from component_base import ComponentBase
+from component_base import ComponentBase, new_http_session
 from mock_base import MockBase as SharedMockBase
 from predbat_metrics import record_api_call
 from utils import str2time, dp2, dp3
@@ -276,12 +276,17 @@ def derive_power_band(loadpoint, voltage):
 class EvccClient:
     """Minimal aiohttp client for the evcc REST API."""
 
-    def __init__(self, host, api_key=None, timeout=15, log=None):
-        """Store the normalised base URL and optional bearer key."""
+    def __init__(self, host, api_key=None, timeout=15, log=None, session_factory=None):
+        """Store the normalised base URL and optional bearer key.
+
+        session_factory is the owning component's http_session; without one a plain
+        aiohttp session is made by component_base.new_http_session.
+        """
         self.host = self.normalise_host(host)
         self.api_key = api_key
         self.timeout = timeout
         self.log = log or (lambda message: None)
+        self.session_factory = session_factory or new_http_session
 
     @staticmethod
     def normalise_host(host):
@@ -322,7 +327,7 @@ class EvccClient:
 
         for attempt in range(max_retries):
             try:
-                async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with self.session_factory(timeout=timeout) as session:
                     call = session.post if method == "POST" else session.get
                     async with call(url, headers=self.headers()) as response:
                         if response.status == 200:
@@ -399,7 +404,7 @@ class EvccAPI(ComponentBase):
             soc_max_age_hours: age past which a remembered vehicle SoC is flagged stale
             timeout: HTTP timeout in seconds
         """
-        self.client = EvccClient(host, api_key=api_key, timeout=timeout, log=self.log)
+        self.client = EvccClient(host, api_key=api_key, timeout=timeout, log=self.log, session_factory=self.http_session)
         self.automatic = bool(automatic)
         self.control = bool(control)
         self.loadpoints_config = loadpoints
